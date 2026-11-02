@@ -1,0 +1,149 @@
+{
+  "name": "clearfairy-vscode",
+  "displayName": "ClearFairy for VS Code",
+  "description": "独り言（思考発話）とコーディングの操作から、判断とその理由を記録する",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "clearfairy.toggleSession",
+        "title": "作業の記録を開始／停止する",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.startSession",
+        "title": "作業の記録を開始する",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.stopSession",
+        "title": "作業の記録を停止する",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.openSession",
+        "title": "記録を見る",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.processSession",
+        "title": "記録から意思決定ステップを作り直す",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.spike.openGuide",
+        "title": "確認の手順ページを開く",
+        "category": "ClearFairy (Phase 0)"
+      },
+      {
+        "command": "clearfairy.spike.environment",
+        "title": "環境を確認する",
+        "category": "ClearFairy (Phase 0)"
+      },
+      {
+        "command": "clearfairy.spike.recordAndTranscribe",
+        "title": "録音して文字起こしする",
+        "category": "ClearFairy (Phase 0)"
+      },
+      {
+        "command": "clearfairy.spike.toggleEventLog",
+        "title": "操作ログの記録を開始／停止する",
+        "category": "ClearFairy (Phase 0)"
+      },
+      {
+        "command": "clearfairy.spike.markEventLog",
+        "title": "操作ログに目印を入れる",
+        "category": "ClearFairy (Phase 0)"
+      },
+      {
+        "command": "clearfairy.spike.languageModel",
+        "title": "Copilot の言語モデルを試す",
+        "category": "ClearFairy (Phase 0)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "clearfairy.spike.markEventLog",
+        "key": "ctrl+alt+m"
+      }
+    ],
+    "configuration": {
+      "title": "ClearFairy",
+      "properties": {
+        "clearfairy.speech.model": {
+          "type": "string",
+          "enum": [
+            "whisper-turbo",
+            "zipformer-ja-en"
+          ],
+          "enumDescriptions": [
+            "正確だが重い（メモリ約 1.7GB、1 発話の認識に 1〜3 秒）",
+            "軽くて速いが誤りが多い（メモリ約 0.4GB）"
+          ],
+          "default": "whisper-turbo",
+          "description": "独り言の文字起こしに使う音声認識モデル（CPU で動かす）"
+        },
+        "clearfairy.speech.modelsDir": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "音声認識モデルの置き場所。空ならこの拡張機能の保存領域。相対パスはワークスペースのフォルダから"
+        },
+        "clearfairy.speech.threads": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "音声認識に使う CPU のスレッド数"
+        },
+        "clearfairy.speech.keepAudio": {
+          "type": "boolean",
+          "default": true,
+          "description": "録音を WAV としてセッションのフォルダに残す（文字起こしをやり直すときに使う）"
+        },
+        "clearfairy.llm.model": {
+          "type": "string",
+          "default": "claude-haiku-5.5",
+          "description": "使う Copilot の言語モデル（id か family）。見つからなければ最初のモデル"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node esbuild.mjs --test && vscode-test",
+    "test:unit": "node esbuild.mjs --unit && node --test \"out/unit/*.test.js\""
+  },
+  "dependencies": {
+    "@picovoice/pvrecorder-node": "^1.2.9",
+    "audify": "^1.10.1",
+    "decibri": "^5.8.0",
+    "diff": "^9.0.0",
+    "sherpa-onnx-node": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.20.5",
+    "@types/vscode": "^1.140.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.28.2",
+    "mocha": "^12.0.3",
+    "typescript": "^7.0.2"
+  }
+}

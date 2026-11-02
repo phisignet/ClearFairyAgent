@@ -1,0 +1,13 @@
+[project]
+name = "clearfairy-playground"
+version = "0.0.0"
+description = "Phase 0 の手動確認用の題材（.py と .ipynb）"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas",
+    "matplotlib",
+    "ipykernel",
+    "polars>=2.0.0",
+    "seaborn>=0.13.2",
+    "pyarrow>=26.0.0",
+]

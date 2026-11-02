@@ -1,0 +1,18 @@
+node_modules/
+dist/
+out/
+.vscode-test/
+*.vsix
+
+# モデル・テスト音声などの大きな生成物
+.cache/
+
+# 拡張機能が作る作業レベルの記録（ワークスペース内）
+.clearfairy/
+
+# playground の Python 環境
+.venv/
+__pycache__/
+
+# playground で eda() などが保存するグラフ
+spike/playground/*.png

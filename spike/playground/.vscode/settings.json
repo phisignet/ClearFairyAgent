@@ -1,0 +1,4 @@
+{
+  // 開発用: 音声認識モデルは、リポジトリの .cache/models（spike/download-models.sh で取得済み）を使う
+  "clearfairy.speech.modelsDir": "../../.cache/models"
+}
