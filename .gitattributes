@@ -1,0 +1,6 @@
+# 改行は LF にそろえる（この PC の git は取り出し時に CRLF へ変換する設定のため。
+# シェルスクリプトが CRLF になると bash で動かない）
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.wav binary
