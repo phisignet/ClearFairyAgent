@@ -15,6 +15,8 @@ interface BaseAction {
   id: string;
   t0: number;
   t1: number;
+  // 文書の URI（ノートブックならセルの文書）。セルを足すと番号がずれるので、場所を指すときはこちらを優先する
+  uri?: string;
 }
 
 // 同じファイル（セル）への手での編集を、間が空くまで 1 つにまとめたもの

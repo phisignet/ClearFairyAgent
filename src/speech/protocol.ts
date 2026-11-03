@@ -35,12 +35,13 @@ export type FromWorker =
   | ProbeResult
   | { type: 'ready'; modelKind: string; loadMs: number; device: string }
   // rms は増幅前の音量（マイクが音を拾えているかの確認用）、gainDb はそのときの増幅量
-  | { type: 'level'; rms: number; gainDb: number }
+  // speaking: VAD が発話の途中と見ているか（話し終わった言葉が文字になるのを待つため）
+  | { type: 'level'; rms: number; gainDb: number; speaking: boolean }
   // start / end は実時刻（エポックミリ秒）。操作ログと突き合わせるため
   | { type: 'utterance'; start: number; end: number; text: string; decodeMs: number }
   // recorder が file のとき、流し込みが終わった
   | { type: 'inputEnded' }
-  | { type: 'stopped'; audioSec: number; speechSec: number; decodeSec: number; wav?: string }
+  | { type: 'stopped'; audioSec: number; speechSec: number; decodeSec: number; lostSec?: number; wav?: string }
   | { type: 'error'; message: string };
 
 // 親側でだけ発生するイベント

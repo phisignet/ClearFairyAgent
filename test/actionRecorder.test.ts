@@ -96,7 +96,8 @@ describe('操作のまとめ役（ActionRecorder）', () => {
     await vscode.window.showTextDocument(vscode.Uri.file(file));
     const recorder = new ActionRecorder(session);
     try {
-      await sleep(3500);
+      // 閲覧として残すのは 3 秒以上。重いときに足りなくならないよう余裕を取る
+      await sleep(4500);
       // 別のファイルに切り替えると、それまでの閲覧が区切られる
       await vscode.window.showTextDocument(vscode.Uri.file(join(dir, 'other.py')));
       await sleep(300);

@@ -16,6 +16,8 @@ const load = {
 const VAD_WINDOW = 512;
 const RING_SECONDS = 60;
 const LEVEL_INTERVAL_MS = 250;
+// この間マイクから音が届かなければ知らせる
+const NO_AUDIO_MS = 5000;
 // Electron は外部バッファ（ネイティブ側のメモリをそのまま見せる配列）を禁止しているので、
 // sherpa-onnx から配列を受け取る関数には false を渡してコピーさせる
 const EXTERNAL_BUFFER = false;
@@ -33,7 +35,31 @@ interface Recorder {
   stop(): void;
 }
 
-function openRecorder(options: StartOptions, onPcm: (pcm: Int16Array) => void, onError: (e: unknown) => void): Recorder {
+// マイクを開く。PvRecorder は一時的に開けないことがある（他のアプリが使っている、ヘッドセットのつなぎ直しなど）ので、
+// 少し待って開き直し、それでも駄目なら decibri で開く
+async function openMicrophone(kind: RecorderKind, onPcm: (pcm: Int16Array) => void, onError: (e: unknown) => void): Promise<Recorder> {
+  const errors: string[] = [];
+  if (kind === 'pvrecorder') {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return openRecorder({ recorder: 'pvrecorder' }, onPcm, onError);
+      } catch (e) {
+        errors.push(`pvrecorder: ${e instanceof Error ? e.message : e}`);
+        await new Promise((r) => setTimeout(r, 700));
+      }
+    }
+    process.stderr.write(`マイクを PvRecorder で開けなかったので decibri で開く（${errors.join(' / ')}）
+`);
+  }
+  try {
+    return openRecorder({ recorder: 'decibri' }, onPcm, onError);
+  } catch (e) {
+    errors.push(`decibri: ${e instanceof Error ? e.message : e}`);
+    throw new Error(`マイクを開けませんでした。ほかのアプリがマイクを使っていないか、ヘッドセットがつながっているかを確かめてください（${errors.join(' / ')}）`);
+  }
+}
+
+function openRecorder(options: Pick<StartOptions, 'recorder' | 'inputWav' | 'speed'>, onPcm: (pcm: Int16Array) => void, onError: (e: unknown) => void): Recorder {
   const kind: RecorderKind = options.recorder;
   if (kind === 'file') {
     const wave: { sampleRate: number; samples: Float32Array } = load.sherpa().readWave(options.inputWav, EXTERNAL_BUFFER);
@@ -55,14 +81,15 @@ function openRecorder(options: StartOptions, onPcm: (pcm: Int16Array) => void, o
   }
   if (kind === 'pvrecorder') {
     const { PvRecorder } = load.pvrecorder();
-    const recorder = new PvRecorder(VAD_WINDOW, -1);
+    // 認識（Whisper で数秒かかる）の間は読み出せないので、受け皿を既定の 50 フレーム（1.6 秒）から 1000 フレーム（32 秒）に広げて取りこぼさないようにする
+    const recorder = new PvRecorder(VAD_WINDOW, -1, 1000);
     let running = true;
     recorder.start();
     void (async () => {
       try {
         while (running) onPcm(await recorder.read());
       } catch (e) {
-        if (running) onError(e);
+        if (running) onError(new Error(`マイクから音を読めませんでした。ヘッドセットを挿し直すか、Windows のサウンド設定でマイクが動いているかを確かめてください（${e instanceof Error ? e.message : e}）`));
       } finally {
         recorder.release();
       }
@@ -216,12 +243,28 @@ class Session {
     if (options.autoGain) this.gain = new AutoGain(options.initialGainDb ?? 0);
   }
 
-  start(): string {
-    this.recorder = openRecorder(this.options, (pcm) => this.feed(pcm), (e) => void send({ type: 'error', message: errorText(e) }));
+  async start(): Promise<string> {
+    const onPcm = (pcm: Int16Array) => this.feed(pcm);
+    const onError = (e: unknown) => void send({ type: 'error', message: errorText(e) });
+    this.recorder = this.options.recorder === 'file' ? openRecorder(this.options, onPcm, onError) : await openMicrophone(this.options.recorder, onPcm, onError);
+    if (this.options.recorder !== 'file') this.watch();
     return this.recorder.device;
   }
 
+  // マイクが開けても音が届かないことがある（USB ヘッドセットが固まったときなど。PvRecorder も decibri も黙ったままになる）。
+  // 認識で止まっている間は届かないので、そのぶんを除いて、音が来ない時間が続いたら知らせる
+  private lastPcm = Date.now();
+  private watchdog?: NodeJS.Timeout;
+  private watch(): void {
+    this.watchdog = setInterval(() => {
+      if (Date.now() - this.lastPcm < NO_AUDIO_MS) return;
+      clearInterval(this.watchdog);
+      void send({ type: 'error', message: `マイクから音が届いていません（${NO_AUDIO_MS / 1000} 秒）。ヘッドセットを挿し直すか、Windows のサウンド設定でマイクが動いているかを確かめてください` });
+    }, 1000);
+  }
+
   private feed(pcm: Int16Array): void {
+    this.lastPcm = Date.now();
     if (this.t0 === 0) this.t0 = Date.now() - (pcm.length / SAMPLE_RATE) * 1000;
     // 保存するのは元の音量のまま（後から設定を変えて処理し直せるように）
     this.wav?.write(pcm);
@@ -237,7 +280,7 @@ class Session {
     const now = Date.now();
     if (now - this.lastLevel >= LEVEL_INTERVAL_MS) {
       this.lastLevel = now;
-      void send({ type: 'level', rms: Math.sqrt(sum / Math.max(1, raw.length)), gainDb: +(this.gain?.gainDb ?? 0).toFixed(1) });
+      void send({ type: 'level', rms: Math.sqrt(sum / Math.max(1, raw.length)), gainDb: +(this.gain?.gainDb ?? 0).toFixed(1), speaking: this.vad.isDetected() });
     }
 
     // VAD には決まった長さの窓で渡す
@@ -250,6 +293,8 @@ class Session {
       this.drain();
     }
     this.pending = merged.slice(offset);
+    // 認識に時間がかかった直後に、音が届いていないと誤って判定しないよう、終わった時点でも更新する
+    this.lastPcm = Date.now();
   }
 
   private drain(): void {
@@ -273,15 +318,19 @@ class Session {
   }
 
   stop(): FromWorker {
+    clearInterval(this.watchdog);
     this.recorder?.stop();
     this.vad.flush();
     this.drain();
     this.wav?.close();
+    const audioSec = this.ring.total / SAMPLE_RATE;
     return {
       type: 'stopped',
-      audioSec: +(this.ring.total / SAMPLE_RATE).toFixed(1),
+      audioSec: +audioSec.toFixed(1),
       speechSec: +this.speechSec.toFixed(1),
       decodeSec: +(this.decodeMs / 1000).toFixed(2),
+      // 録音していた時間に対して届かなかった音声（認識で止まっている間にマイクの受け皿があふれた分など）
+      lostSec: this.options.recorder === 'file' || this.t0 === 0 ? 0 : +Math.max(0, (Date.now() - this.t0) / 1000 - audioSec).toFixed(1),
       wav: this.wav?.path,
     };
   }
@@ -325,7 +374,7 @@ process.on('message', async (msg: ToWorker) => {
         break;
       case 'start': {
         session = new Session(msg.options);
-        const device = session.start();
+        const device = await session.start();
         await send({ type: 'ready', modelKind: session.modelKind, loadMs: session.loadMs, device });
         break;
       }

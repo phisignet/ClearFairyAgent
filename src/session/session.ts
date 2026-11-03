@@ -8,7 +8,8 @@ import { ActionRecorder } from '../capture/actionRecorder';
 import type { Action } from '../capture/actions';
 import { EventLog } from '../capture/eventLog';
 import type { SpeechModelId } from '../config';
-import { SpeechWorker } from '../speech/client';
+import { isNoiseUtterance } from '../pipeline/sentences';
+import { firstLine, SpeechWorker } from '../speech/client';
 import type { ModelPaths } from '../speech/modelStore';
 import type { RecorderKind } from '../speech/protocol';
 
@@ -25,7 +26,8 @@ export interface SessionInfo {
   workspace?: string;
   speechModel: SpeechModelId;
   device?: string;
-  stats?: { audioSec: number; speechSec: number; decodeSec: number; utterances: number; actions: number };
+  // lostSec: 録音していた時間のうち、マイクから届かなかった音声の秒数
+  stats?: { audioSec: number; speechSec: number; decodeSec: number; lostSec?: number; utterances: number; actions: number };
 }
 
 export interface StartOptions {
@@ -60,7 +62,14 @@ export class WorkSession {
   // 音声ワーカーが途中で落ちたとき
   private readonly failEmitter = new vscode.EventEmitter<string>();
   readonly onFail = this.failEmitter.event;
+  // 質問に音声で答えている間の発話（作業の文字起こしには入れない）。これまでに話した回答の全文を通知する
+  private readonly answerEmitter = new vscode.EventEmitter<string>();
+  readonly onAnswerText = this.answerEmitter.event;
+  private answering: string[] | undefined;
+  private quietWaiters: (() => void)[] = [];
   level = 0;
+  // VAD が発話の途中と見ているか
+  speaking = false;
   gainDb = 0;
   utterances = 0;
   private stopping = false;
@@ -79,6 +88,30 @@ export class WorkSession {
 
   get actions(): number {
     return this.recorder.count;
+  }
+
+  // 質問に音声で答え始める。endAnswer() までの発話は回答として扱う
+  beginAnswer(): void {
+    this.answering = [];
+  }
+
+  // ボタンを押す直前の言葉も回答に入れるため、VAD が区切って（無音 0.5 秒）文字にし終えるまで待ってから閉じる。
+  // 文字にする処理は音声の受け取りと同じ流れで動くので、その後に届く「話していない」通知は、文字にし終えた後に来る
+  // 記録を止めた後なら、もう待つものは無い
+  async endAnswer(): Promise<string> {
+    if (!this.stopping) {
+      await new Promise((r) => setTimeout(r, 600));
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 8000);
+        this.quietWaiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    const text = this.answering?.join('') ?? '';
+    this.answering = undefined;
+    return text;
   }
 
   static async start(o: StartOptions): Promise<WorkSession> {
@@ -129,16 +162,27 @@ export class WorkSession {
         case 'level':
           this.level = e.rms;
           this.gainDb = e.gainDb;
+          this.speaking = e.speaking;
+          if (!e.speaking) for (const f of this.quietWaiters.splice(0)) f();
           break;
         case 'utterance': {
           const u: Utterance = { start: e.start, end: e.end, text: e.text };
+          if (this.answering) {
+            // 黙っている間に Whisper が作る「ご視聴ありがとうございました」などは回答に入れない
+            const noise = isNoiseUtterance(e.text);
+            appendFileSync(join(this.dir, 'answers.jsonl'), JSON.stringify(noise ? { ...u, noise: true } : u) + '\n');
+            if (noise) break;
+            this.answering.push(e.text);
+            this.answerEmitter.fire(this.answering.join(''));
+            break;
+          }
           this.utterances++;
           appendFileSync(join(this.dir, 'utterances.jsonl'), JSON.stringify(u) + '\n');
           this.utteranceEmitter.fire(u);
           break;
         }
         case 'error':
-          this.failEmitter.fire(e.message);
+          this.failEmitter.fire(firstLine(e.message));
           break;
         case 'exit':
           if (!this.stopping) this.failEmitter.fire(`音声ワーカーが終了しました（code=${e.code}）`);
@@ -153,20 +197,22 @@ export class WorkSession {
 
   async stop(): Promise<SessionInfo> {
     this.stopping = true;
-    let audio = { audioSec: 0, speechSec: 0, decodeSec: 0 };
+    let audio: { audioSec: number; speechSec: number; decodeSec: number; lostSec?: number } = { audioSec: 0, speechSec: 0, decodeSec: 0 };
     try {
       if (this.worker.running) audio = await this.worker.request({ type: 'stop' }, 'stopped', 60_000);
     } catch {
       // 止めるときの失敗は記録を残すことを優先して無視する
     }
     this.worker.dispose();
+    for (const f of this.quietWaiters.splice(0)) f();
     await this.recorder.stop();
     this.events.dispose();
     this.info.endedAt = Date.now();
-    this.info.stats = { audioSec: audio.audioSec, speechSec: audio.speechSec, decodeSec: audio.decodeSec, utterances: this.utterances, actions: this.recorder.count };
+    this.info.stats = { audioSec: audio.audioSec, speechSec: audio.speechSec, decodeSec: audio.decodeSec, lostSec: audio.lostSec, utterances: this.utterances, actions: this.recorder.count };
     this.save();
     this.utteranceEmitter.dispose();
     this.failEmitter.dispose();
+    this.answerEmitter.dispose();
     return this.info;
   }
 }

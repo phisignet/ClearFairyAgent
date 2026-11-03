@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import * as vscode from 'vscode';
 import type { Action } from '../capture/actions';
 import type { SessionInfo } from '../session/session';
-import type { StepSummary, Task } from '../pipeline/steps';
+import type { Evaluation, Question, StepSummary, Task } from '../pipeline/steps';
 
 interface StoredStep {
   id: string;
@@ -14,12 +14,15 @@ interface StoredStep {
   t1: number;
   kind: 'linked' | 'talk' | 'action-only';
   summary?: StepSummary;
+  evaluation?: Evaluation;
+  question?: Question;
   sentences: { id: string; t0: number; text: string; original?: string }[];
   actionGroups: { id: string; kind: string; element: string; actions: string[] }[];
 }
 
 const KIND_LABEL = { linked: '発話＋操作', talk: '発話だけ', 'action-only': '操作だけ' };
 const NO_REASON = '（理由は述べていない）';
+const LEVEL_LABEL = { strong: '理由: 十分', weak: '理由: 弱い', empty: '理由: 無い' };
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const readJsonl = <T>(file: string): T[] =>
@@ -52,9 +55,15 @@ export function openSessionView(dir: string): void {
   panel.webview.html = render(panel.webview, dir);
 }
 
+// 開いている記録の画面を描き直す（回答を反映したときなど）
+export function refreshSessionView(dir: string): void {
+  const panel = panels.get(dir);
+  if (panel) panel.webview.html = render(panel.webview, dir);
+}
+
 const dateLabel = (t: number) => new Date(t).toLocaleString('ja-JP', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-async function openLocation(file: string, cell?: number, line?: number): Promise<void> {
+export async function openLocation(file: string, cell?: number, line?: number): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) return;
   const uri = vscode.Uri.joinPath(folder.uri, file);
@@ -115,18 +124,26 @@ function render(webview: vscode.Webview, dir: string): string {
     }
   };
 
+  // 確認の質問と回答
+  const question = (q?: Question) => {
+    if (!q) return '';
+    const state = q.status === 'answered' ? `<p class="answer">回答: ${esc(q.answer?.text ?? '')}</p>` : q.status === 'dismissed' ? '<p class="none">答えなかった</p>' : '<p class="none">未回答（サイドバーの「確認の質問」から答えられます）</p>';
+    return `<div class="qa ${q.status}"><p class="q">❓ ${esc(q.text)}</p>${state}</div>`;
+  };
+
   const card = (s: StoredStep) => {
     const sum = s.summary;
     const noReason = !sum || sum.rationale.includes(NO_REASON);
     const stepActions = s.actionGroups.flatMap((g) => g.actions.map((id) => actions.get(id)).filter((a): a is Action => !!a));
     return `
     <li class="step ${s.kind}" id="${s.id}">
-      <div class="meta"><span class="t">${at(s.t0)}〜${at(s.t1)}</span><span class="badge">${KIND_LABEL[s.kind]}</span>${sum ? `<span class="badge ${sum.knowledge}">${sum.knowledge === 'general' ? '一般的なコーディング' : '業務・データ固有'}</span>` : ''}</div>
+      <div class="meta"><span class="t">${at(s.t0)}〜${at(s.t1)}</span><span class="badge">${KIND_LABEL[s.kind]}</span>${sum ? `<span class="badge ${sum.knowledge}">${sum.knowledge === 'general' ? '一般的なコーディング' : '業務・データ固有'}</span>` : ''}${s.evaluation ? `<span class="badge level-${s.evaluation.level}" title="${esc(`${s.evaluation.categories.join(', ')}: ${s.evaluation.reason}`)}">${LEVEL_LABEL[s.evaluation.level]}</span>` : ''}</div>
       <p class="decision">${esc(sum?.decision_and_actions ?? '（要約なし）')}</p>
       <dl>
         <dt>理由</dt><dd class="${noReason ? 'none' : ''}">${esc(noReason ? '発話では理由を述べていない' : sum.rationale)}</dd>
         <dt>経緯</dt><dd>${esc(sum?.progression ?? '')}</dd>
       </dl>
+      ${question(s.question)}
       <details>
         <summary>発話 ${s.sentences.length} ・ 操作 ${stepActions.length}</summary>
         ${s.sentences.length ? `<ul class="said">${s.sentences.map((x) => `<li><span class="t">${at(x.t0)}</span> ${esc(x.text)}${x.original ? ` <span class="orig" title="補正前: ${esc(x.original)}">補正</span>` : ''}</li>`).join('')}</ul>` : ''}
@@ -174,6 +191,13 @@ function render(webview: vscode.Webview, dir: string): string {
   .step.talk { border-left-color: var(--vscode-charts-purple); }
   .step.action-only { border-left-color: var(--vscode-charts-orange); }
   .meta { display: flex; gap: 10px; align-items: center; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+  .badge.level-strong { border-color: var(--vscode-charts-green); }
+  .badge.level-weak { border-color: var(--vscode-charts-yellow); color: var(--vscode-charts-yellow); }
+  .badge.level-empty { border-color: var(--vscode-charts-orange); color: var(--vscode-charts-orange); }
+  .qa { border-left: 3px solid var(--vscode-charts-yellow); padding: 2px 10px; margin: 8px 0; background: var(--vscode-textBlockQuote-background); }
+  .qa.answered { border-left-color: var(--vscode-charts-green); }
+  .qa p { margin: 2px 0; }
+  .qa .q { font-weight: 600; }
   .badge { border: 1px solid var(--vscode-panel-border); border-radius: 10px; padding: 0 8px; font-size: 0.85em; }
   .decision { font-weight: 600; margin: 6px 0; }
   dl { display: grid; grid-template-columns: 3em 1fr; gap: 2px 8px; margin: 4px 0; }

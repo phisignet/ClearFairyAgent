@@ -189,6 +189,7 @@ export class ActionRecorder implements vscode.Disposable {
           t0: c.t0,
           t1: c.t1,
           file: c.file,
+          uri: c.uri.toString(),
           cell: c.cell,
           lines: range,
           symbols: await this.symbolsAt(c.uri, range),
@@ -250,7 +251,7 @@ export class ActionRecorder implements vscode.Disposable {
     this.track(
       (async () => {
         const symbols = v.lines ? await this.symbolsAt(v.uri, v.lines) : [];
-        this.emit({ kind: 'view', id, t0: v.t0, t1, file: v.file, lines: v.lines, cells: v.cells, symbols });
+        this.emit({ kind: 'view', id, t0: v.t0, t1, file: v.file, uri: v.uri?.toString(), lines: v.lines, cells: v.cells, symbols });
       })(),
     );
   }
@@ -299,6 +300,7 @@ export class ActionRecorder implements vscode.Disposable {
       t1: s?.timing?.endTime ?? now,
       file: vscode.workspace.asRelativePath(notebook.uri),
       cell: cell.index,
+      uri: cell.document.uri.toString(),
       order: s?.executionOrder,
       success: s?.success,
       source: excerpt(cell.document.getText(), 800),

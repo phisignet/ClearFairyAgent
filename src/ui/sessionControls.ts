@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { SPEECH_MODELS, settings } from '../config';
 import { sessionsRoot, WorkSession, type SessionInfo } from '../session/session';
-import { ModelStore } from '../speech/modelStore';
+import { ModelStore, type ModelPaths } from '../speech/modelStore';
 
 export class SessionController implements vscode.Disposable {
   private session: WorkSession | undefined;
@@ -12,6 +12,9 @@ export class SessionController implements vscode.Disposable {
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changed.event;
+  // 記録を始めたとき（記録中の処理をつなぐ）
+  private readonly startedEmitter = new vscode.EventEmitter<WorkSession>();
+  readonly onDidStart = this.startedEmitter.event;
   // 記録を止めたとき（後段の処理に渡す）
   private readonly stoppedEmitter = new vscode.EventEmitter<{ info: SessionInfo; dir: string }>();
   readonly onDidStop = this.stoppedEmitter.event;
@@ -36,6 +39,11 @@ export class SessionController implements vscode.Disposable {
   private modelStore(): ModelStore {
     const dir = settings().modelsDir || join(this.context.globalStorageUri.fsPath, 'models');
     return new ModelStore(dir);
+  }
+
+  // 音声認識モデルの場所（無ければダウンロードを聞く）。記録していないときに音声で答えるのに使う
+  speechModel(): Promise<ModelPaths | undefined> {
+    return this.modelStore().ensure(settings().speechModel);
   }
 
   async toggle(): Promise<void> {
@@ -67,6 +75,7 @@ export class SessionController implements vscode.Disposable {
       });
       this.log.appendLine(`記録を始めました: ${this.session.dir}（${SPEECH_MODELS[s.speechModel].label}、マイク: ${this.session.info.device}）`);
       this.timer = setInterval(() => this.render(), 500);
+      this.startedEmitter.fire(this.session);
     } catch (e) {
       void vscode.window.showErrorMessage(`ClearFairy: 記録を始められませんでした（${e instanceof Error ? e.message : e}）`);
     } finally {
@@ -118,6 +127,7 @@ export class SessionController implements vscode.Disposable {
     if (this.session) void this.session.stop();
     this.status.dispose();
     this.changed.dispose();
+    this.startedEmitter.dispose();
     this.stoppedEmitter.dispose();
   }
 }

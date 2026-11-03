@@ -44,6 +44,16 @@
         "category": "ClearFairy"
       },
       {
+        "command": "clearfairy.showQuestions",
+        "title": "確認の質問を見る",
+        "category": "ClearFairy"
+      },
+      {
+        "command": "clearfairy.answerQuestion",
+        "title": "確認の質問に答える",
+        "category": "ClearFairy"
+      },
+      {
         "command": "clearfairy.spike.openGuide",
         "title": "確認の手順ページを開く",
         "category": "ClearFairy (Phase 0)"
@@ -74,6 +84,32 @@
         "category": "ClearFairy (Phase 0)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "clearfairy",
+          "title": "ClearFairy",
+          "icon": "media/clearfairy.svg"
+        }
+      ]
+    },
+    "views": {
+      "clearfairy": [
+        {
+          "type": "webview",
+          "id": "clearfairy.questions",
+          "name": "確認の質問"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "clearfairy.answerQuestion",
+          "when": "false"
+        }
+      ]
+    },
     "keybindings": [
       {
         "command": "clearfairy.spike.markEventLog",

@@ -39,6 +39,64 @@ export interface Step {
   sentences: Sentence[];
   actionGroups: ActionGroup[];
   summary?: StepSummary;
+  // 業務・データ固有のステップだけ評価する
+  evaluation?: Evaluation;
+  // 業務・データ固有で、理由が弱い・無いステップへの質問
+  question?: Question;
+  // 質問を作らなかった理由（聞いたことの繰り返し、データを眺めただけ など）
+  questionSkipped?: string;
+}
+
+// 論文の Rationale Evaluation。categories は S-SR / S-PK / S-CA / W-SR / W-PK / W-CA / E
+export interface Evaluation {
+  categories: string[];
+  level: 'strong' | 'weak' | 'empty';
+  reason: string;
+}
+
+// 質問を出す場所（その判断の最後の編集・実行など）
+export interface Anchor {
+  file: string;
+  // 文書の URI（セルを足すと番号がずれるので、分かるときはこちらで探す）
+  uri?: string;
+  cell?: number;
+  line?: number;
+}
+
+export interface Question {
+  id: string;
+  text: string;
+  status: 'open' | 'answered' | 'dismissed';
+  createdAt: number;
+  anchor?: Anchor;
+  answer?: { text: string; via: 'text' | 'voice'; at: number };
+}
+
+// 論文どおり、Strong を 1 つでも含めば strong、Weak だけなら weak、どちらも無ければ empty
+export function levelOf(categories: string[]): Evaluation['level'] {
+  if (categories.some((c) => c.startsWith('S-'))) return 'strong';
+  if (categories.some((c) => c.startsWith('W-'))) return 'weak';
+  return 'empty';
+}
+
+// 質問を出す場所。最後の編集かセルの実行を優先し、無ければ閲覧などから選ぶ
+export function anchorOf(step: Step): Anchor | undefined {
+  const actions = step.actionGroups.flatMap((g) => g.actions).sort((a, b) => b.t0 - a.t0);
+  const a = actions.find((x) => x.kind === 'edit' || x.kind === 'cell-run') ?? actions.find((x) => x.kind === 'view' || x.kind === 'debug' || x.kind === 'diagnostics');
+  switch (a?.kind) {
+    case 'edit':
+      return { file: a.file, uri: a.uri, cell: a.cell, line: a.lines[0] };
+    case 'cell-run':
+      return { file: a.file, uri: a.uri, cell: a.cell };
+    case 'view':
+      return { file: a.file, uri: a.uri, line: a.lines?.[0], cell: a.cells?.[0] };
+    case 'debug':
+      return a.file ? { file: a.file, line: a.line } : undefined;
+    case 'diagnostics':
+      return { file: a.file, cell: a.cell };
+    default:
+      return undefined;
+  }
 }
 
 // 同じ操作に結び付いた発話のまとまりを同じステップにするのは、間に挟まるまとまりが 1 つまでのとき
@@ -53,9 +111,17 @@ export function makeGroups(ids: string[][], sentences: Sentence[], startIndex: n
   const used = new Set<string>();
   const groups: SentenceGroup[] = [];
   for (const g of ids) {
-    const members = g.map((id) => byId.get(id)).filter((s): s is Sentence => !!s && !used.has(s.id));
+    // 同じ文が別のまとまりや同じまとまりに重ねて入っていたら、最初の 1 回だけ使う
+    const members: Sentence[] = [];
+    for (const id of g) {
+      const s = byId.get(id);
+      if (s && !used.has(s.id)) {
+        used.add(s.id);
+        members.push(s);
+      }
+    }
     if (members.length === 0) continue;
-    members.forEach((s) => used.add(s.id));
+    members.sort((a, b) => a.t0 - b.t0);
     groups.push({ id: `G${startIndex + groups.length + 1}`, t0: members[0].t0, t1: members[members.length - 1].t1, sentences: members });
   }
   // LLM が入れ忘れた文は、それだけのまとまりにする（漏れなく残すため）

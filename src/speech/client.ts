@@ -3,6 +3,9 @@ import { fork, type ChildProcess } from 'node:child_process';
 import * as vscode from 'vscode';
 import type { FromWorker, ToWorker, WorkerEvent } from './protocol';
 
+// ワーカーのエラーはスタック付きで届くので、通知には 1 行目だけ出す
+export const firstLine = (message: string): string => message.split('\n')[0].replace(/^Error: /, '');
+
 export class SpeechWorker implements vscode.Disposable {
   private child: ChildProcess | undefined;
   private readonly emitter = new vscode.EventEmitter<WorkerEvent>();
@@ -28,7 +31,11 @@ export class SpeechWorker implements vscode.Disposable {
       const timer = setTimeout(() => done(() => reject(new Error(`音声ワーカーが ${timeoutMs}ms 以内に ${type} を返さなかった`))), timeoutMs);
       const sub = this.onEvent((e) => {
         if (e.type === type) done(() => resolve(e as Extract<FromWorker, { type: T }>));
-        else if (e.type === 'error') done(() => reject(new Error(e.message)));
+        else if (e.type === 'error') {
+          // スタックは出力パネルに残し、呼び出し側（通知）には 1 行目だけ渡す
+          this.log.appendLine(`[speech] ${e.message}`);
+          done(() => reject(new Error(firstLine(e.message))));
+        }
         else if (e.type === 'exit') done(() => reject(new Error(`音声ワーカーが終了した（code=${e.code}, signal=${e.signal}）`)));
       });
       const done = (f: () => void) => {

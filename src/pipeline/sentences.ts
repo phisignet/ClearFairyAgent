@@ -42,8 +42,11 @@ export function noiseOf(text: string): Sentence['noise'] {
   return undefined;
 }
 
-// 発話を文に分ける。時刻は、発話の中の文字数の割合で配分する
-export function toSentences(utterances: Utterance[]): Sentence[] {
+// 発話がまるごと雑音（幻覚・相づち）か。質問への音声の回答から除くのに使う
+export const isNoiseUtterance = (text: string): boolean => toSentences([{ start: 0, end: 1, text }]).every((s) => s.noise);
+
+// 発話を文に分ける。時刻は、発話の中の文字数の割合で配分する。記録中に少しずつ分けるときは、id の通し番号を startIndex から続ける
+export function toSentences(utterances: Utterance[], startIndex = 0): Sentence[] {
   const segmenter = new Intl.Segmenter('ja', { granularity: 'sentence' });
   const out: Sentence[] = [];
   for (const u of utterances) {
@@ -54,7 +57,7 @@ export function toSentences(utterances: Utterance[]): Sentence[] {
       const t0 = u.start + ((u.end - u.start) * done) / total;
       done += p.length;
       const t1 = u.start + ((u.end - u.start) * done) / total;
-      out.push({ id: `s${out.length + 1}`, t0: Math.round(t0), t1: Math.round(t1), text: p, noise: noiseOf(p) });
+      out.push({ id: `s${startIndex + out.length + 1}`, t0: Math.round(t0), t1: Math.round(t1), text: p, noise: noiseOf(p) });
     }
   }
   return out;

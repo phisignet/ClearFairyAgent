@@ -3,7 +3,7 @@ import * as assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { Action } from '../../src/capture/actions';
 import { describeAction, groupActions, persistentDiagnostics } from '../../src/pipeline/actionGroups';
-import { noiseOf, toSentences } from '../../src/pipeline/sentences';
+import { isNoiseUtterance, noiseOf, toSentences } from '../../src/pipeline/sentences';
 import { buildSteps, makeGroups, makeTasks, type Step } from '../../src/pipeline/steps';
 import { splitWindows } from '../../src/pipeline/windows';
 
@@ -18,6 +18,12 @@ describe('文への分割と雑音', () => {
     assert.equal(noiseOf('ん'), 'filler');
     assert.equal(noiseOf('うーん、'), 'filler');
     assert.equal(noiseOf('商品間では比較したいから横並べの方がいいな'), undefined);
+  });
+
+  it('音声の回答から、まるごと雑音の発話だけを除く', () => {
+    assert.equal(isNoiseUtterance('ご視聴ありがとうございました'), true);
+    assert.equal(isNoiseUtterance('はい'), true);
+    assert.equal(isNoiseUtterance('はい。店舗によって仕入れ価格が違います。'), false);
   });
 
   it('発話を文に分け、時刻を文字数で配分する', () => {
