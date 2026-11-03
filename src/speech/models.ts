@@ -1,5 +1,4 @@
 // sherpa-onnx の音声認識モデルの設定を、モデルのディレクトリのファイル構成から組み立てる。
-// spike/asr-bench.mjs からも Node の型除去で直接読み込むので、型注釈以外の TypeScript 構文は使わない。
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 

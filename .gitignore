@@ -14,5 +14,16 @@ out/
 .venv/
 __pycache__/
 
-# playground で eda() などが保存するグラフ
-spike/playground/*.png
+# spike/ は、playground（開発ホストで開く練習用のワークスペース）の設定・Python 環境・練習用データの作り方だけを載せる。
+# Phase 0 の検証スクリプトと、練習で作るノートブック・データ・グラフは手元だけに置く
+spike/*
+!spike/playground/
+spike/playground/*
+!spike/playground/.vscode/
+!spike/playground/pyproject.toml
+!spike/playground/uv.lock
+!spike/playground/make_sales.py
+
+# 統合テストが一時ファイルを作るワークスペース
+test/workspace/*
+!test/workspace/README.md

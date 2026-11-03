@@ -1,4 +1,4 @@
-# Phase 0: 文のリスト（JSON の say）を Windows の日本語音声で読み上げ、16kHz モノラルの WAV にする。
+# 文のリスト（JSON の say）を Windows の日本語音声で読み上げ、16kHz モノラルの WAV にする。
 # 文の間に無音を入れて 1 本の「作業セッション」にする（VAD で区切れるかも確かめるため）。
 param(
   [Parameter(Mandatory)] [string] $SentencesJson,

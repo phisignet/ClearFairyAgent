@@ -56,9 +56,11 @@
 ```sh
 npm install
 npm run build        # dist/ に束ねる（npm run watch で監視）
-npm test             # テスト用の VS Code を別に起動して統合テスト（ログインはしていない）
+npm test             # テスト用の VS Code を別に起動して統合テスト（ログインはしていない。ワークスペースは test/workspace）
 npm run test:unit    # vscode に依存しない処理の単体テスト
 bash scripts/download-models.sh sherpa-onnx-whisper-turbo sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17
+# 統合テストで流す読み上げ音声（.cache/testdata/tts/haruka-desktop.wav）を Windows の音声合成で作る
+powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json -OutDir .cache/testdata/tts -Voices 'Microsoft Haruka Desktop'
 ```
 
 - **Ctrl+Shift+B**（タスク「開発ホストを開く」）で、ビルドしてから `spike/playground` を開いた開発ホストが立ち上がる。VS Code 1.144 では F5（デバッガ付き）で開くと拡張機能のプロセスが起動直後に落ちる（終了コード 134）ので、デバッガは付けない。playground では音声認識モデルにリポジトリの `.cache/models` を使う（`spike/playground/.vscode/settings.json`）
@@ -76,7 +78,7 @@ bash scripts/download-models.sh sherpa-onnx-whisper-turbo sherpa-onnx-zipformer-
   node scripts/dev-job.mjs '{"type":"openSession","session":"<日時>"}'
   ```
 
-- `spike/` は Phase 0（技術検証）のスクリプトと結果。詳しくは `spike/README.md`
+- `spike/playground/` は開発ホストで開く練習用のワークスペース。git に載せているのは設定（`.vscode/settings.json`）、Python 環境（`uv sync --project spike/playground`）、練習用の売上明細を作る `make_sales.py`（`sales_2026.csv` を作る。乱数の種は固定）だけで、練習で作るノートブック・データ・グラフは載せない（`.gitignore`）
 
 ## 構成
 
@@ -91,4 +93,5 @@ bash scripts/download-models.sh sherpa-onnx-whisper-turbo sherpa-onnx-zipformer-
 | `src/ui/` | ステータスバーのボタン、記録を見る画面、確認の質問（`questions.ts`） |
 | `src/dev/` | 開発用の依頼の受け口 |
 | `src/spike/` | Phase 0 の検証用コマンド（手順ページ） |
-| `test/` | 統合テスト |
+| `test/` | 統合テスト（`test/unit/` は単体テスト） |
+| `scripts/` | 開発用のスクリプト（モデルの取得、テスト用の読み上げ音声の生成、開発ホストへの依頼） |

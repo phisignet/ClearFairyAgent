@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0: sherpa-onnx の日本語対応モデルと VAD を .cache/models/ に取得する。
+# sherpa-onnx の日本語対応モデルと VAD を .cache/models/ に取得する。
 # 各アーカイブはモデル名のディレクトリに展開する（取得済みならスキップ）。
 set -euo pipefail
 
