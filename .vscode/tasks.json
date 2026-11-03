@@ -9,7 +9,7 @@
     },
     {
       // 開発ホスト（spike/playground を開いた開発用ウィンドウ）を、デバッガを付けずに開く。
-      // VS Code 1.144 では F5（デバッガ付き）で開くと、拡張機能のプロセスが起動直後に落ちる（終了コード 134）ため
+      // VS Code 1.144.0 では F5（デバッガ付き）で開くと、拡張機能のプロセスが起動直後に落ちた（終了コード 134。1.144.1 では落ちない）
       "label": "開発ホストを開く",
       "type": "shell",
       "command": "code --extensionDevelopmentPath=\"${workspaceFolder}\" --new-window \"${workspaceFolder}/spike/playground\"",

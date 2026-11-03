@@ -63,7 +63,7 @@ bash scripts/download-models.sh sherpa-onnx-whisper-turbo sherpa-onnx-zipformer-
 powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json -OutDir .cache/testdata/tts -Voices 'Microsoft Haruka Desktop'
 ```
 
-- **Ctrl+Shift+B**（タスク「開発ホストを開く」）で、ビルドしてから `spike/playground` を開いた開発ホストが立ち上がる。VS Code 1.144 では F5（デバッガ付き）で開くと拡張機能のプロセスが起動直後に落ちる（終了コード 134）ので、デバッガは付けない。playground では音声認識モデルにリポジトリの `.cache/models` を使う（`spike/playground/.vscode/settings.json`）
+- **Ctrl+Shift+B**（タスク「開発ホストを開く」）で、ビルドしてから `spike/playground` を開いた開発ホストが立ち上がる。デバッガは付けない（VS Code 1.144.0 では F5 で開くと拡張機能のプロセスが起動直後に落ちた。終了コード 134。1.144.1 では落ちない）。playground では音声認識モデルにリポジトリの `.cache/models` を使う（`spike/playground/.vscode/settings.json`）
 - Copilot の言語モデルはサインイン済みの VS Code の中でしか呼べないので、開発ホストに外から依頼を出せるようにしてある（`src/dev/jobs.ts`、開発ホストでだけ有効）
 
   ```sh
