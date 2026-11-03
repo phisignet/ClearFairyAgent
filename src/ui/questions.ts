@@ -345,6 +345,8 @@ function html(): string {
   const vscode = acquireVsCodeApi();
   const drafts = {};
   const byVoice = {};
+  // 音声で聞き取った全文（入力欄には、この続きだけを足す）
+  const heard = {};
   const notes = {};
   let state = { items: [] };
   const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -413,17 +415,23 @@ function html(): string {
     }
     if (data.voiceText) {
       const { key, text, final, auto } = data.voiceText;
-      // 最後に空で返ってきたとき（何も聞き取れなかった）は、それまでの下書きを消さない
-      if (text || !final) {
-        drafts[key] = text;
+      // 届くのはこれまでに聞き取った全文。聞き取りの途中で手で直した分（聞き違いの修正など）を消さないよう、
+      // 前に届いた分の続きだけを入力欄の末尾に足す
+      const prev = heard[key] ?? '';
+      const add = text.startsWith(prev) ? text.slice(prev.length) : text;
+      if (add) {
+        heard[key] = text;
         byVoice[key] = true;
+        const box = document.querySelector('.q[data-key="' + CSS.escape(key) + '"] textarea');
+        if (box) {
+          box.setRangeText(add, box.value.length, box.value.length, 'preserve');
+          drafts[key] = box.value;
+        } else drafts[key] = (drafts[key] ?? '') + add;
       }
       if (final) {
+        delete heard[key];
         notes[key] = auto ? '話さない時間が続いたので聞き取りを終えました。内容を確かめて送信してください。' : '';
         render();
-      } else {
-        const box = document.querySelector('.q[data-key="' + CSS.escape(key) + '"] textarea');
-        if (box) box.value = text;
       }
     }
     if (data.focus) {
@@ -462,6 +470,8 @@ function html(): string {
       box?.focus();
       box?.setSelectionRange(box.value.length, box.value.length);
     } else {
+      // 新しく聞き取りを始めたら、届く全文は空から始まる
+      if (act === 'voiceStart') delete heard[key];
       vscode.postMessage({ type: act, key });
     }
   });

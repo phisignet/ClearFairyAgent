@@ -53,6 +53,8 @@ export interface PipelineOptions {
 }
 
 const MAX_LINK_IMAGES = 4;
+// 文字起こしの補正に見せる、前の区切りで直した文の数
+const MAX_PAST_FIXES = 20;
 const MAX_SUMMARY_IMAGES = 2;
 // 推測に見せる過去の判断の数（関係しそうなものと直近のもの。history.ts の selectPast）
 const MAX_PAST = 40;
@@ -77,16 +79,23 @@ async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<v
   );
 }
 
-// 同じ時間帯に本人が書いたコード・実行したコマンド（文字起こしの補正の手がかり）
+// 同じ時間帯に本人が書いたコード・実行したコマンドと、セルの出力に出てきた日本語の語（文字起こしの補正の手がかり）。
+// 店舗名・商品名のようなデータの値はコードに書かれないことが多く、出力にしか出てこない
 function codeHints(actions: Action[]): string {
   const lines = new Set<string>();
+  const words = new Set<string>();
   for (const a of actions) {
     if (a.kind === 'edit') for (const l of a.diff.split('\n')) if (/^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l)) lines.add(l.slice(1).trim());
-    if (a.kind === 'cell-run') for (const l of a.source.split('\n')) lines.add(l.trim());
+    if (a.kind === 'cell-run') {
+      for (const l of a.source.split('\n')) lines.add(l.trim());
+      for (const o of a.outputs) if (o.text && o.mime === 'text/plain') for (const w of o.text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}ー]{2,}/gu) ?? []) words.add(w);
+    }
     if (a.kind === 'terminal') lines.add(a.command);
     if (a.kind === 'edit' || a.kind === 'view') for (const s of a.symbols) lines.add(s);
   }
-  return [...lines].filter((l) => l.length > 1).slice(0, 100).join('\n') || '（なし）';
+  const code = [...lines].filter((l) => l.length > 1).slice(0, 100);
+  if (words.size > 0) code.push(`（セルの出力に出てきた語: ${[...words].slice(0, 60).join('、')}）`);
+  return code.join('\n') || '（なし）';
 }
 
 // steps.json に保存する形（操作は id だけ持つ）
@@ -226,9 +235,18 @@ export class Pipeline {
   // 1. 文字起こしの補正
   private async correct(win: Window, hints: Action[], tag: string): Promise<Sentence[]> {
     if (win.sentences.length === 0) return [];
+    // 同じ聞き違い（店名など）は記録の中で繰り返すので、前の区切りで直した文も見せる
+    const before = this.sentences
+      .filter((s) => s.original && !s.noise && s.t0 < win.t0)
+      .slice(-MAX_PAST_FIXES)
+      .map((s) => `${s.original} → ${s.text}`);
     const r = await this.call<{ sentences: { id: string; text: string | null }[] }>(
       `${tag}-1-correct`,
-      this.o.prompts.render('correct', { code: codeHints(hints), sentences: win.sentences.map((s) => this.line(s)).join('\n') }),
+      this.o.prompts.render('correct', {
+        code: codeHints(hints),
+        fixed: before.length > 0 ? before.join('\n') : '（なし）',
+        sentences: win.sentences.map((s) => this.line(s)).join('\n'),
+      }),
     );
     const fixed = new Map((r.sentences ?? []).map((s) => [s.id, s.text]));
     for (const s of win.sentences) {
