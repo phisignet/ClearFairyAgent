@@ -35,6 +35,13 @@
 | `answers.jsonl` | 記録中に音声で答えた回答の文字起こし |
 | `pipeline/` | ステップを作るときの LLM との入出力（プロンプトの調整用） |
 
+## AI エージェントから記録を読む
+
+記録の読み方（場所、各項目の意味、本人の理由として信頼できるのはどれか）を skill にしてある（`skills/clearfairy-records/SKILL.md`）。読み方を教えるだけで、記録を書き換えたり、別の場所に書き出したりはしない。
+
+- **GitHub Copilot**: 拡張機能が skill を渡す。チャットで「前回の作業で何を判断した？」のように聞くと、Copilot が必要と判断したときに読む
+- **その他のエージェント（Claude Code など）**: 同じ内容を、拡張機能の起動時に `.clearfairy/README.md` に置く（毎回上書きする）。「`.clearfairy/README.md` を読んで、前回の作業で何を判断したか教えて」のように渡す
+
 ## 話し方（何をどう言えば残るか）
 
 残したいのは、一般的なプログラミングの知識ではなく、**このデータ・この業務だからこその理由**（データの意味、業務の決まり、何を比べたいか）。独り言は、次のように話すと残りやすい。
@@ -90,6 +97,7 @@ powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json
 | `src/llm/` | Copilot の言語モデル |
 | `src/pipeline/` | 記録から意思決定ステップを作る処理（論文の CLEAR・要約・理由の評価・質問・理由の推測）。本体は `engine.ts`、止めた後にまとめて処理するのが `run.ts`、記録中に少しずつ処理するのが `live.ts`、推測に使う前の記録の判断を集めるのが `history.ts` |
 | `prompts/` | LLM へのプロンプト（毎回ファイルから読むので、拡張機能を読み込み直さずに調整できる） |
+| `skills/` | AI エージェント向けの記録の読み方（Copilot に渡す skill） |
 | `src/ui/` | ステータスバーのボタン、記録を見る画面、確認の質問（`questions.ts`） |
 | `src/dev/` | 開発用の依頼の受け口 |
 | `src/spike/` | Phase 0 の検証用コマンド（手順ページ） |

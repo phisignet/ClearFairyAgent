@@ -17,6 +17,11 @@
     "onStartupFinished"
   ],
   "contributes": {
+    "chatSkills": [
+      {
+        "path": "./skills/clearfairy-records/SKILL.md"
+      }
+    ],
     "commands": [
       {
         "command": "clearfairy.toggleSession",

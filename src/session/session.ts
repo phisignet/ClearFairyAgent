@@ -1,7 +1,7 @@
 // 作業セッション: 録音（音声ワーカー）と操作の記録を同時に開始・停止し、.clearfairy/sessions/<日時>/ に保存する。
 // 保存するもの: session.json（概要）、utterances.jsonl（発話ごとの文字起こし）、actions.jsonl（操作）、
 // events.jsonl（生のイベント）、images/（セルの画像出力）、audio.wav（録音。設定で止められる）
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { ActionRecorder } from '../capture/actionRecorder';
@@ -54,6 +54,11 @@ export function sessionsRoot(context: vscode.ExtensionContext): string {
   mkdirSync(join(root, 'sessions'), { recursive: true });
   if (!existsSync(join(root, '.gitignore'))) writeFileSync(join(root, '.gitignore'), '*\n');
   return join(root, 'sessions');
+}
+
+// 記録の読み方を記録の隣に置く。Copilot には chatSkills で渡すが、他のツールには届かないので
+export function writeRecordsGuide(context: vscode.ExtensionContext): void {
+  copyFileSync(context.asAbsolutePath(join('skills', 'clearfairy-records', 'SKILL.md')), join(sessionsRoot(context), '..', 'README.md'));
 }
 
 export class WorkSession {

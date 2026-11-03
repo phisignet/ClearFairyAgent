@@ -12,7 +12,7 @@ import { LivePipeline } from './pipeline/live';
 import { Prompts } from './pipeline/prompts';
 import { runPipeline, type PipelineResult } from './pipeline/run';
 import type { Step } from './pipeline/steps';
-import { sessionsRoot, type SessionInfo } from './session/session';
+import { sessionsRoot, writeRecordsGuide, type SessionInfo } from './session/session';
 import { VoiceAnswer } from './speech/voiceAnswer';
 import { registerSpikeCommands } from './spike/commands';
 import { QuestionsController } from './ui/questions';
@@ -21,6 +21,11 @@ import { openSessionView, refreshSessionView } from './ui/sessionView';
 
 export function activate(context: vscode.ExtensionContext): void {
   const log = vscode.window.createOutputChannel('ClearFairy');
+  try {
+    writeRecordsGuide(context);
+  } catch (e) {
+    log.appendLine(`記録の読み方を置けませんでした: ${e}`);
+  }
   const controller = new SessionController(context, log);
   const llm = new Llm(() => settings().llmModel);
   const prompts = new Prompts(context.asAbsolutePath('prompts'));

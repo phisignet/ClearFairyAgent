@@ -61,4 +61,10 @@ describe('作業セッション', () => {
     assert.ok(existsSync(join(session.dir, 'audio.wav')), '録音を残すこと');
     assert.deepEqual(JSON.parse(readFileSync(join(session.dir, 'session.json'), 'utf8')).stats, info.stats);
   });
+
+  it('拡張機能を起動すると、記録の読み方を .clearfairy/README.md に置く', async () => {
+    await vscode.extensions.getExtension('local.clearfairy-vscode')!.activate();
+    const guide = join(vscode.workspace.workspaceFolders![0].uri.fsPath, '.clearfairy', 'README.md');
+    assert.equal(readFileSync(guide, 'utf8'), readFileSync(join(root, 'skills', 'clearfairy-records', 'SKILL.md'), 'utf8'));
+  });
 });
