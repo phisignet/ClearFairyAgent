@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import * as vscode from 'vscode';
 import type { Action } from '../capture/actions';
 import type { SessionInfo } from '../session/session';
-import type { Evaluation, Question, StepSummary, Task } from '../pipeline/steps';
+import { NO_REASON, type Evaluation, type Inference, type Question, type StepSummary, type Task } from '../pipeline/steps';
 
 interface StoredStep {
   id: string;
@@ -16,13 +16,14 @@ interface StoredStep {
   summary?: StepSummary;
   evaluation?: Evaluation;
   question?: Question;
+  inference?: Inference;
   sentences: { id: string; t0: number; text: string; original?: string }[];
   actionGroups: { id: string; kind: string; element: string; actions: string[] }[];
 }
 
 const KIND_LABEL = { linked: '発話＋操作', talk: '発話だけ', 'action-only': '操作だけ' };
-const NO_REASON = '（理由は述べていない）';
 const LEVEL_LABEL = { strong: '理由: 十分', weak: '理由: 弱い', empty: '理由: 無い' };
+const INFERENCE_LABEL = { open: '確かめていない', accepted: '合っている', revised: '直して答えた', rejected: '違う' };
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const readJsonl = <T>(file: string): T[] =>
@@ -124,11 +125,26 @@ function render(webview: vscode.Webview, dir: string): string {
     }
   };
 
-  // 確認の質問と回答
-  const question = (q?: Question) => {
+  // 確認の質問と回答。過去の判断からの推測を添えていたら、その確かめた結果と元にした判断も
+  const question = (q?: Question, inf?: Inference) => {
     if (!q) return '';
-    const state = q.status === 'answered' ? `<p class="answer">回答: ${esc(q.answer?.text ?? '')}</p>` : q.status === 'dismissed' ? '<p class="none">答えなかった</p>' : '<p class="none">未回答（サイドバーの「確認の質問」から答えられます）</p>';
-    return `<div class="qa ${q.status}"><p class="q">❓ ${esc(q.text)}</p>${state}</div>`;
+    const state =
+      q.status === 'answered'
+        ? `<p class="answer">回答: ${q.answer?.via === 'inference' ? '推測が合っていた' : esc(q.answer?.text ?? '')}</p>`
+        : q.status === 'dismissed'
+          ? '<p class="none">答えなかった</p>'
+          : '<p class="none">未回答（サイドバーの「確認の質問」から答えられます）</p>';
+    const basis = inf?.basis.map((d) => `${d.session ? `${new Date(d.at).toLocaleDateString('ja-JP')} の記録` : 'この記録'}「${d.decision}」 → ${d.rationale}`).join('\n');
+    const guess = inf ? `<p class="inf" title="${esc(`元にした判断:\n${basis}\n\n推測の筋道: ${inf.reasoning}`)}">💡 推測（${INFERENCE_LABEL[inf.status]}）: ${esc(inf.text)}</p>` : '';
+    return `<div class="qa ${q.status}"><p class="q">❓ ${esc(q.text)}</p>${guess}${state}</div>`;
+  };
+
+  // 理由の評価。確認だけのステップは、見て気づいたことを説明していたときだけ出す（説明しないのが普通なので）
+  const badge = (s: StoredStep) => {
+    const e = s.evaluation;
+    const check = s.summary?.step_type === 'check';
+    if (!e || (check && e.level !== 'strong')) return '';
+    return `<span class="badge level-${e.level}" title="${esc(`${e.categories.join(', ')}: ${e.reason}`)}">${check ? '説明あり' : LEVEL_LABEL[e.level]}</span>`;
   };
 
   const card = (s: StoredStep) => {
@@ -137,13 +153,13 @@ function render(webview: vscode.Webview, dir: string): string {
     const stepActions = s.actionGroups.flatMap((g) => g.actions.map((id) => actions.get(id)).filter((a): a is Action => !!a));
     return `
     <li class="step ${s.kind}" id="${s.id}">
-      <div class="meta"><span class="t">${at(s.t0)}〜${at(s.t1)}</span><span class="badge">${KIND_LABEL[s.kind]}</span>${sum ? `<span class="badge ${sum.knowledge}">${sum.knowledge === 'general' ? '一般的なコーディング' : '業務・データ固有'}</span>` : ''}${s.evaluation ? `<span class="badge level-${s.evaluation.level}" title="${esc(`${s.evaluation.categories.join(', ')}: ${s.evaluation.reason}`)}">${LEVEL_LABEL[s.evaluation.level]}</span>` : ''}</div>
+      <div class="meta"><span class="t">${at(s.t0)}〜${at(s.t1)}</span><span class="badge">${KIND_LABEL[s.kind]}</span>${sum ? `<span class="badge ${sum.knowledge}">${sum.knowledge === 'general' ? '一般的なコーディング' : '業務・データ固有'}</span>` : ''}${sum?.step_type === 'check' ? '<span class="badge" title="中身を見ただけで、まだ何も選んでいない（理由の評価と質問はしない）">確認だけ</span>' : ''}${badge(s)}</div>
       <p class="decision">${esc(sum?.decision_and_actions ?? '（要約なし）')}</p>
       <dl>
         <dt>理由</dt><dd class="${noReason ? 'none' : ''}">${esc(noReason ? '発話では理由を述べていない' : sum.rationale)}</dd>
         <dt>経緯</dt><dd>${esc(sum?.progression ?? '')}</dd>
       </dl>
-      ${question(s.question)}
+      ${question(s.question, s.inference)}
       <details>
         <summary>発話 ${s.sentences.length} ・ 操作 ${stepActions.length}</summary>
         ${s.sentences.length ? `<ul class="said">${s.sentences.map((x) => `<li><span class="t">${at(x.t0)}</span> ${esc(x.text)}${x.original ? ` <span class="orig" title="補正前: ${esc(x.original)}">補正</span>` : ''}</li>`).join('')}</ul>` : ''}
@@ -198,6 +214,7 @@ function render(webview: vscode.Webview, dir: string): string {
   .qa.answered { border-left-color: var(--vscode-charts-green); }
   .qa p { margin: 2px 0; }
   .qa .q { font-weight: 600; }
+  .qa .inf { color: var(--vscode-descriptionForeground); cursor: help; }
   .badge { border: 1px solid var(--vscode-panel-border); border-radius: 10px; padding: 0 8px; font-size: 0.85em; }
   .decision { font-weight: 600; margin: 6px 0; }
   dl { display: grid; grid-template-columns: 3em 1fr; gap: 2px 8px; margin: 4px 0; }

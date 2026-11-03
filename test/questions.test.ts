@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
-import type { Question } from '../src/pipeline/steps';
+import type { Inference, Question } from '../src/pipeline/steps';
 import { QuestionsController } from '../src/ui/questions';
 
 const workspace = vscode.workspace.workspaceFolders![0].uri;
@@ -17,7 +17,8 @@ describe('確認の質問', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'session.json'), JSON.stringify({ id: '20260101-000000', startedAt: 0, speechModel: 'zipformer-ja-en' }));
     const q = (id: string, status: Question['status'], anchor: Question['anchor']): Question => ({ id, text: `質問 ${id}`, status, createdAt: 1, anchor });
-    const step = (id: string, question: Question) => ({ id, t0: 0, t1: 1, kind: 'linked', sentences: [], actionGroups: [], question });
+    const step = (id: string, question: Question, inference?: Inference) => ({ id, t0: 0, t1: 1, kind: 'linked', sentences: [], actionGroups: [], question, inference });
+    const inference: Inference = { text: '返品は売上に数えないため', reasoning: '', basis: [], status: 'open', at: 1 };
     writeFileSync(
       join(dir, 'steps.json'),
       JSON.stringify({
@@ -25,7 +26,7 @@ describe('確認の質問', () => {
         steps: [
           step('st1', q('q1', 'open', { file: 'analysis.py', line: 3 })),
           // セルの URI が分からなくても、ノートブックのパスとセル番号で探す
-          step('st2', q('q2', 'open', { file: 'explore.ipynb', uri: 'vscode-notebook-cell:/gone#X', cell: 1 })),
+          step('st2', q('q2', 'open', { file: 'explore.ipynb', uri: 'vscode-notebook-cell:/gone#X', cell: 1 }), inference),
           step('st3', q('q3', 'dismissed', { file: 'analysis.py', line: 5 })),
         ],
       }),
@@ -57,12 +58,13 @@ describe('確認の質問', () => {
     assert.equal(lenses[0].command?.command, 'clearfairy.answerQuestion');
   });
 
-  it('ノートブックではセルの上に出す', async () => {
+  it('ノートブックではセルの上に出し、過去の判断からの推測があればそう示す', async () => {
     const nb = await vscode.workspace.openNotebookDocument(vscode.Uri.joinPath(workspace, 'explore.ipynb'));
-    const hits = nb.getCells().map((c) => controller.provideCodeLenses(c.document).length);
+    const lenses = nb.getCells().map((c) => controller.provideCodeLenses(c.document));
     assert.deepEqual(
-      hits.map((n, i) => (n > 0 ? i : -1)).filter((i) => i >= 0),
+      lenses.map((l, i) => (l.length > 0 ? i : -1)).filter((i) => i >= 0),
       [1],
     );
+    assert.equal(lenses[1][0].command?.title, '❓ ClearFairy: 質問 q2（💡 推測あり）');
   });
 });

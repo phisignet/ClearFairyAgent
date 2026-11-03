@@ -7,7 +7,8 @@
 //   5. 結び付かなかった発話を前後に割り当てる（Sentence Assigning） prompts/assign.md
 //   6. ステップを組み立てて要約し、業務・データ固有か一般的なコーディングかを判定する  steps.ts / prompts/summarize.md
 //   7. 業務・データ固有のステップの理由を評価し（Rationale Evaluation）、弱い・無いものに質問を作る
-//      prompts/evaluate.md / prompts/question.md。回答をもらったら要約を作り直す（prompts/summarize-answer.md）
+//      prompts/evaluate.md / prompts/question.md。質問の前に本人の過去の判断から理由を推測し（Rationale Inference、prompts/infer.md）、
+//      質問に添える。前の説明からの推測で足りるなら、質問の代わりに推測の確認だけ出す。回答をもらったら要約を作り直す（prompts/summarize-answer.md）
 //   8. ステップの列を小作業のまとまりに分ける（上の層）              prompts/tasks.md
 // LLM との入出力は <セッション>/pipeline/ に残す。
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -15,9 +16,26 @@ import { join } from 'node:path';
 import type { Action } from '../capture/actions';
 import type { Message, Part, TextResult } from '../llm/llm';
 import { clock, describeGroup, groupActions, imagesOf, isWeak, type ActionGroup } from './actionGroups';
+import { selectPast } from './history';
 import type { Prompts } from './prompts';
 import type { Sentence } from './sentences';
-import { anchorOf, buildSteps, levelOf, makeGroups, makeTasks, mergeSteps, type Direction, type Evaluation, type SentenceGroup, type Step, type StepSummary, type Task } from './steps';
+import {
+  anchorOf,
+  buildSteps,
+  isJustified,
+  levelOf,
+  makeGroups,
+  makeTasks,
+  mergeSteps,
+  type AnswerVia,
+  type Direction,
+  type Evaluation,
+  type PastDecision,
+  type SentenceGroup,
+  type Step,
+  type StepSummary,
+  type Task,
+} from './steps';
 import type { Window } from './windows';
 
 export interface PipelineLlm {
@@ -30,10 +48,16 @@ export interface PipelineOptions {
   llm: PipelineLlm;
   log?: (message: string) => void;
   concurrency?: number;
+  // 前の記録の、推測の元にできる判断（history.ts）
+  history?: () => PastDecision[];
 }
 
 const MAX_LINK_IMAGES = 4;
 const MAX_SUMMARY_IMAGES = 2;
+// 推測に見せる過去の判断の数（関係しそうなものと直近のもの。history.ts の selectPast）
+const MAX_PAST = 40;
+// 前の説明からの推測で足りるときに、質問の代わりに出す確認
+const CONFIRM_TEXT = '前に説明した理由から推測しました。合っていますか？';
 
 // 発話や操作が 1 件も無いセッションでは、ファイル自体が無い
 export const readJsonl = <T>(file: string): T[] =>
@@ -241,12 +265,15 @@ export class Pipeline {
         }),
         step.actionGroups.flatMap(imagesOf).slice(-MAX_SUMMARY_IMAGES),
       );
-      // 判定が無いときは、見落とさないよう業務・データ固有として扱う
+      // 判定が無いときは、見落とさないよう業務・データ固有の判断として扱う
       if (step.summary.knowledge !== 'general') step.summary.knowledge = 'domain';
+      if (step.summary.step_type !== 'check') step.summary.step_type = 'decision';
     });
   }
 
-  // 7a. 業務・データ固有のステップの理由を評価する（一般的なコーディングは評価しない）
+  // 7a. 業務・データ固有のステップの理由を評価する（一般的なコーディングは評価しない）。
+  //     中身を見ただけの確認も評価する。質問はしないが、見て気づいたことを説明していれば（吉祥寺が少ないのは 8 月開店だから、など）
+  //     データの意味を述べた過去の説明として、後の推測に使えるようにするため
   async evaluate(steps: Step[]): Promise<void> {
     const targets = steps.filter((s) => s.summary?.knowledge === 'domain');
     await mapLimit(targets, this.o.concurrency ?? 3, async (step) => {
@@ -264,40 +291,112 @@ export class Pipeline {
       step.evaluation = evaluation;
       // 中身が変わったので、質問するかは考え直す
       step.questionSkipped = undefined;
-      // 合流して理由が十分になったら、出していた質問は取り下げる
-      if (evaluation.level === 'strong' && step.question?.status === 'open') step.question.status = 'dismissed';
+      // 合流して理由が十分になった、または確認だけになったら、出していた質問は取り下げる
+      if ((evaluation.level === 'strong' || step.summary?.step_type === 'check') && step.question?.status === 'open') step.question.status = 'dismissed';
     });
   }
 
-  // 7b. 業務・データ固有で理由が弱い・無いステップに、質問を 1 つ作る。質問を作ったステップを返す
+  // これまでに出した質問と、その結果（質問を作るときに見せる）
+  private describeQuestion(s: Step): string {
+    const q = s.question!;
+    const what = q.kind === 'confirm' ? `（前の説明からの推測「${s.inference?.text ?? ''}」が合っているかの確認）` : q.text;
+    const result = q.answer
+      ? q.answer.via === 'inference'
+        ? ' → 推測が合っていた'
+        : ` → 回答: ${q.answer.text}`
+      : q.status === 'dismissed'
+        ? '（答えなかった）'
+        : s.inference?.status === 'rejected'
+          ? '（推測は違った）'
+          : '';
+    return `- ${what}${result}`;
+  }
+
+  // 7b. 業務・データ固有の判断で理由が弱い・無いステップに、質問を 1 つ作る。質問を作ったステップを返す。
+  //     中身を見ただけの確認には聞かない（列の分布を順に見ているだけのところに「業務上どういう意味か」と聞くと、作業の邪魔になるだけ）。
+  //     先に過去の判断から理由を推測し（7c）、前の説明からの推測で足りるなら、新しく聞かずに推測が合っているかだけ確かめる
+  //     （記録をまたいで同じことを聞き直さないため）
   async askQuestions(steps: Step[]): Promise<Step[]> {
-    const targets = steps.filter((s) => s.summary?.knowledge === 'domain' && s.evaluation && s.evaluation.level !== 'strong' && !s.question && !s.questionSkipped);
-    // 同じことを重ねて聞かないよう、これまでの質問（と回答）を見せながら 1 つずつ作る
+    const targets = steps.filter(
+      (s) => s.summary?.knowledge === 'domain' && s.summary.step_type !== 'check' && s.evaluation && s.evaluation.level !== 'strong' && !s.question && !s.questionSkipped,
+    );
+    await this.infer(targets);
+    // 同じ記録の中で同じことを重ねて聞かないよう、これまでの質問（と回答）を見せながら 1 つずつ作る
     for (const step of targets) {
-      const asked = this.steps
-        .filter((s) => s.question)
-        .map((s) => `- ${s.question!.text}${s.question!.answer ? ` → 回答: ${s.question!.answer.text}` : s.question!.status === 'dismissed' ? '（答えなかった）' : ''}`);
-      const r = await this.call<{ question?: string | null; skip?: string }>(
+      const asked = this.steps.filter((s) => s.question).map((s) => this.describeQuestion(s));
+      const inf = step.inference;
+      const r = await this.call<{ question?: string | null; covered?: string; skip?: string }>(
         `question-${step.id}`,
         this.o.prompts.render('question', {
           decision: step.summary?.decision_and_actions ?? '',
           sentences: this.describeSentences(step),
           reason: step.evaluation?.reason ?? '',
+          inference: inf ? `${inf.text}\n元にした判断: ${inf.basis.map((d) => `${d.decision} → ${d.rationale}`).join(' / ')}` : '（なし）',
           asked: asked.length > 0 ? asked.join('\n') : '（まだ無い）',
         }),
       );
-      if (r.question) step.question = { id: `q${++this.questionCount}`, text: r.question, status: 'open', createdAt: Date.now(), anchor: anchorOf(step) };
-      else step.questionSkipped = r.skip ?? '聞くことが無い';
+      const open = { status: 'open' as const, createdAt: Date.now(), anchor: anchorOf(step) };
+      // 同じ記録の中で少し前に自分で話した理由なら、確かめるまでもないので何も出さない（確かめるのは前の記録の説明から推測したときだけ）
+      const ownOnly = inf?.basis.every((d) => !d.session);
+      if (r.question) step.question = { id: `q${++this.questionCount}`, kind: 'ask', text: r.question, ...open };
+      else if (r.covered && inf && !ownOnly) step.question = { id: `q${++this.questionCount}`, kind: 'confirm', text: CONFIRM_TEXT, ...open };
+      else if (r.covered && inf) {
+        step.questionSkipped = `この記録の前のほうで説明している（${inf.basis.map((d) => d.step).join('、')}）`;
+        step.inference = undefined;
+      } else {
+        step.questionSkipped = r.skip ?? r.covered ?? '聞くことが無い';
+        // 聞かないなら推測も見せない
+        step.inference = undefined;
+      }
     }
     return targets.filter((s) => s.question);
   }
 
-  // 回答を受け取り、回答込みで要約を作り直す（論文 A.4.2）
-  async answer(stepId: string, text: string, via: 'text' | 'voice'): Promise<Step> {
+  // 7c. 理由の弱い・無いステップの理由を、本人の過去の判断から推測する（論文の Rationale Inference）。
+  //     要素・処理・目的が具体的に重なる判断があるときだけ推測し、質問と並べて見せて本人に確かめてもらう。推測したステップを返す
+  async infer(steps: Step[]): Promise<Step[]> {
+    const targets = steps.filter((s) => !s.inference);
+    if (targets.length === 0) return [];
+    const earlier = this.o.history?.() ?? [];
+    const clean = this.sentences.filter((s) => !s.noise);
+    const label = (d: PastDecision) => (d.session ? `前の記録（${new Date(d.at).toLocaleDateString('ja-JP')}）` : `この記録 ${this.at(d.at)}`);
+    await mapLimit(targets, this.o.concurrency ?? 3, async (step) => {
+      // 同じ記録の前の判断も使う（その場で答えた質問が、次の推測に効く）
+      const own = this.steps
+        .filter((s) => s !== step && s.t0 < step.t0 && isJustified(s))
+        .sort((a, b) => a.t0 - b.t0)
+        .map((s): PastDecision => ({ step: s.id, at: s.t0, decision: s.summary!.decision_and_actions, rationale: s.summary!.rationale }));
+      const query = `${step.summary?.decision_and_actions ?? ''}\n${this.describeSentences(step)}\n${this.describeActions(step)}`;
+      const past = selectPast(query, [...earlier, ...own], MAX_PAST);
+      if (past.length === 0) return;
+      const context = clean.filter((s) => s.t0 >= step.t0 - 180_000 && s.t0 <= step.t1 + 60_000);
+      const r = await this.call<{ inferred_rationale?: string | null; reasoning?: string; basis?: string[] }>(
+        `infer-${step.id}`,
+        this.o.prompts.render('infer', {
+          transcript: context.map((s) => `[${this.at(s.t0)}] ${s.text}`).join('\n') || '（なし）',
+          decision: step.summary?.decision_and_actions ?? '',
+          sentences: this.describeSentences(step),
+          actions: this.describeActions(step),
+          reason: step.evaluation?.reason ?? '',
+          past: past.map((d, i) => `p${i + 1} [${label(d)}]\n  判断: ${d.decision}\n  理由: ${d.rationale}`).join('\n'),
+        }),
+      );
+      // 元にした判断を示せない推測は出さない（本人が確かめようがない）
+      const basis = (r.basis ?? []).map((id) => past[Number(/^p(\d+)$/.exec(id)?.[1]) - 1]).filter((d): d is PastDecision => !!d);
+      const text = r.inferred_rationale?.trim();
+      if (text && text !== 'None' && basis.length > 0) step.inference = { text, reasoning: r.reasoning ?? '', basis, status: 'open', at: Date.now() };
+    });
+    return targets.filter((s) => s.inference);
+  }
+
+  // 回答を受け取り、回答込みで要約を作り直す（論文 A.4.2）。推測を見せていたら、推測も合わせて渡す
+  async answer(stepId: string, text: string, via: AnswerVia): Promise<Step> {
     const step = this.steps.find((s) => s.id === stepId);
     if (!step?.question) throw new Error(`質問のあるステップ ${stepId} が見つからない`);
     step.question.status = 'answered';
     step.question.answer = { text, via, at: Date.now() };
+    const shown = step.inference?.status === 'open' && via !== 'inference' ? step.inference.text : undefined;
+    if (step.inference?.status === 'open') step.inference.status = via === 'inference' ? 'accepted' : 'revised';
     const summary = await this.call<StepSummary>(
       `answer-${step.id}`,
       this.o.prompts.render('summarize-answer', {
@@ -307,12 +406,27 @@ export class Pipeline {
         sentences: this.describeSentences(step),
         actions: this.describeActions(step),
         question: step.question.text,
+        inference: shown ?? '（なし）',
         answer: text,
       }),
     );
-    step.summary = { ...summary, knowledge: summary.knowledge === 'general' ? 'general' : 'domain' };
+    step.summary = { ...summary, knowledge: summary.knowledge === 'general' ? 'general' : 'domain', step_type: step.summary?.step_type };
     this.save();
     return step;
+  }
+
+  // 推測した理由が合っていれば、そのまま回答にする
+  acceptInference(stepId: string): Promise<Step> {
+    const inference = this.steps.find((s) => s.id === stepId)?.inference;
+    if (!inference) throw new Error(`推測のあるステップ ${stepId} が見つからない`);
+    return this.answer(stepId, inference.text, 'inference');
+  }
+
+  // 推測が違えば、推測だけ取り下げる（質問には答えられる）
+  rejectInference(stepId: string): void {
+    const step = this.steps.find((s) => s.id === stepId);
+    if (step?.inference) step.inference.status = 'rejected';
+    this.save();
   }
 
   dismiss(stepId: string): void {

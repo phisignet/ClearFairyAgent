@@ -7,6 +7,7 @@ import { startDevJobs } from './dev/jobs';
 import { copilotModels } from './llm/copilot';
 import { Llm, type Message, type Part } from './llm/llm';
 import { Pipeline, type PipelineOptions } from './pipeline/engine';
+import { loadHistory } from './pipeline/history';
 import { LivePipeline } from './pipeline/live';
 import { Prompts } from './pipeline/prompts';
 import { runPipeline, type PipelineResult } from './pipeline/run';
@@ -32,6 +33,8 @@ export function activate(context: vscode.ExtensionContext): void {
       log.appendLine(`[pipeline] ${m}`);
       onLog?.(m);
     },
+    // 理由の推測には、同じワークスペースの前の記録の判断も使う
+    history: () => loadHistory(sessionsRoot(context), dir),
   });
   const run = (dir: string, target = llm, onLog?: (m: string) => void): Promise<PipelineResult> => runPipeline(pipelineOptions(dir, target, onLog));
 
@@ -226,11 +229,19 @@ export function activate(context: vscode.ExtensionContext): void {
       const target = model ? new Llm(() => model) : llm;
       return job.json ? target.json(messages) : target.text(messages);
     },
-    // 記録したセッションから意思決定ステップを作る（{ "session": "<id>", "model"?: "<id か family>" }）
+    // 記録したセッションから意思決定ステップを作る（{ "session": "<id>", "model"?: "<id か family>" }）。
+    // "copy": true なら .clearfairy/dev/rerun-<id>/ に写して作り直す（元の結果と回答は変えず、質問の一覧にも出さない）
     pipeline: async (job) => {
       const model = typeof job.model === 'string' ? job.model : undefined;
-      const r = await run(join(sessionsRoot(context), String(job.session)), model ? new Llm(() => model) : llm);
-      questions.refresh();
+      const src = join(sessionsRoot(context), String(job.session));
+      let dir = src;
+      if (job.copy) {
+        dir = join(sessionsRoot(context), '..', 'dev', `rerun-${job.session}`);
+        rmSync(dir, { recursive: true, force: true });
+        cpSync(src, dir, { recursive: true, filter: (f) => !/[\\/](steps\.json|sentences\.json|pipeline)$/.test(f) });
+      }
+      const r = await runPipeline({ ...pipelineOptions(dir, model ? new Llm(() => model) : llm), history: () => loadHistory(sessionsRoot(context), src) });
+      if (!job.copy) questions.refresh();
       return {
         ms: r.ms,
         steps: r.steps.length,
@@ -238,21 +249,64 @@ export function activate(context: vscode.ExtensionContext): void {
         noise: r.sentences.filter((s) => s.noise).length,
         corrected: r.sentences.filter((s) => s.original).length,
         questions: openCount(r.steps),
+        domain: r.steps
+          .filter((s) => s.summary?.knowledge === 'domain')
+          .map((s) => ({ step: s.id, type: s.summary?.step_type, level: s.evaluation?.level, decision: s.summary?.decision_and_actions, kind: s.question?.kind, question: s.question?.text, inferred: s.inference?.text, skip: s.questionSkipped })),
       };
     },
     // 質問だけ作り直す（{ "session": "<id>" }）。未回答の質問と、質問しなかった判断を考え直す
+    // "all": true なら答えた質問も作り直す。"dry": true なら保存しない（前の記録の説明で聞き直しが減るかを見るときなど）
     questions: async (job) => {
       const p = Pipeline.load(pipelineOptions(join(sessionsRoot(context), String(job.session))));
       for (const s of p.steps) {
-        if (s.question?.status === 'open') s.question = undefined;
+        if (s.question?.status === 'open' || (job.all && s.question)) {
+          s.question = undefined;
+          s.inference = undefined;
+        }
         s.questionSkipped = undefined;
       }
       await p.askQuestions(p.steps);
-      p.save();
-      questions.refresh();
+      if (!job.dry) {
+        p.save();
+        questions.refresh();
+      }
       return p.steps
         .filter((s) => s.summary?.knowledge === 'domain' && s.evaluation?.level !== 'strong')
-        .map((s) => ({ step: s.id, level: s.evaluation?.level, decision: s.summary?.decision_and_actions, question: s.question?.text, skip: s.questionSkipped }));
+        .map((s) => ({
+          step: s.id,
+          level: s.evaluation?.level,
+          decision: s.summary?.decision_and_actions,
+          kind: s.question?.kind,
+          question: s.question?.text,
+          inferred: s.inference?.text,
+          basis: s.inference?.basis.map((b) => `${b.session ?? 'この記録'} ${b.step}: ${b.rationale}`),
+          skip: s.questionSkipped,
+        }));
+    },
+    // 質問を出した判断の理由を、過去の判断から推測する（{ "session": "<id>", "step"?: "<ステップ id>" }）。結果は保存しない。
+    // 実際の回答と並べて返す（推測の当たり外れを見るため。推測には回答を渡さない）
+    infer: async (job) => {
+      const dir = join(sessionsRoot(context), String(job.session));
+      const p = Pipeline.load(pipelineOptions(dir));
+      const results = [];
+      for (const s of p.steps.filter((x) => x.question && (!job.step || x.id === job.step))) {
+        const { question, inference } = s;
+        s.inference = undefined;
+        const file = join(dir, 'pipeline', `infer-${s.id}.json`);
+        rmSync(file, { force: true });
+        const got = (await p.infer([s]))[0]?.inference;
+        const raw = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as { value: { reasoning?: string } }).value : undefined;
+        results.push({
+          step: s.id,
+          question: question!.text,
+          answer: question!.answer?.text,
+          inferred: got?.text ?? null,
+          reasoning: got?.reasoning ?? raw?.reasoning ?? '（推測の元にできる過去の判断が無い）',
+          basis: got?.basis.map((b) => `${b.session ?? 'この記録'} ${b.step}: ${b.rationale}`),
+        });
+        s.inference = inference;
+      }
+      return results;
     },
     // 質問に答える（{ "session": "<id>", "step": "<ステップ id>", "text": "<回答>" }）
     answer: async (job) => {
@@ -273,7 +327,8 @@ export function activate(context: vscode.ExtensionContext): void {
       const shift = Date.now() + 1000 - info.startedAt;
       writeFileSync(join(dir, 'session.json'), JSON.stringify({ ...info, startedAt: info.startedAt + shift }));
       const lines = (f: string) => (existsSync(join(src, f)) ? readFileSync(join(src, f), 'utf8').split('\n').filter(Boolean) : []);
-      const l = new LivePipeline({ ...pipelineOptions(dir), concurrency: 6 });
+      // 推測に使う過去の判断は、流し直す記録より前のものだけ（流し直しの記録は今の時刻で始まったことになるため）
+      const l = new LivePipeline({ ...pipelineOptions(dir), concurrency: 6, history: () => loadHistory(sessionsRoot(context), src) });
       const events = [
         ...lines('utterances.jsonl').map((x) => {
           const u = JSON.parse(x) as { start: number; end: number; text: string };

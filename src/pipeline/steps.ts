@@ -18,6 +18,9 @@ export interface StepSummary {
   progression: string;
   // domain: 業務・データ固有（その会社・データだからこその事実や方針） / general: 一般的なコーディング（AI がもともと知っていること）
   knowledge: 'domain' | 'general';
+  // decision: 扱い方・処理・見せ方を選んだ / check: 中身を見ただけで、まだ何も選んでいない（理由は評価せず、質問もしない）。
+  // 無ければ decision（これを足す前の記録）
+  step_type?: 'decision' | 'check';
 }
 
 // 小作業のまとまり（ステップの上の層）
@@ -45,6 +48,8 @@ export interface Step {
   question?: Question;
   // 質問を作らなかった理由（聞いたことの繰り返し、データを眺めただけ など）
   questionSkipped?: string;
+  // 質問と並べて見せる、本人の過去の判断から推測した理由
+  inference?: Inference;
 }
 
 // 論文の Rationale Evaluation。categories は S-SR / S-PK / S-CA / W-SR / W-PK / W-CA / E
@@ -65,11 +70,44 @@ export interface Anchor {
 
 export interface Question {
   id: string;
+  // confirm: 前に説明した理由からの推測で足りるので、新しく聞かずに推測が合っているかだけ確かめる（無ければ ask）
+  kind?: 'ask' | 'confirm';
   text: string;
   status: 'open' | 'answered' | 'dismissed';
   createdAt: number;
   anchor?: Anchor;
-  answer?: { text: string; via: 'text' | 'voice'; at: number };
+  answer?: { text: string; via: AnswerVia; at: number };
+}
+
+// inference: 推測した理由を「合っている」としてそのまま回答にした
+export type AnswerVia = 'text' | 'voice' | 'inference';
+
+// 推測の元にする、本人の過去の判断（業務・データ固有で、理由が十分だったか質問に答えたもの）
+export interface PastDecision {
+  // 前の記録ならそのフォルダ名。同じ記録なら無し
+  session?: string;
+  step: string;
+  at: number;
+  decision: string;
+  rationale: string;
+}
+
+// 過去の判断から推測した理由（論文の Rationale Inference）。質問と並べて見せ、本人が確かめる
+export interface Inference {
+  text: string;
+  // そう推測した筋道（どの判断のどこが重なるか）
+  reasoning: string;
+  basis: PastDecision[];
+  // open: まだ確かめていない / accepted: 合っている / revised: 推測を見て自分の言葉で答えた / rejected: 違う
+  status: 'open' | 'accepted' | 'revised' | 'rejected';
+  at: number;
+}
+
+export const NO_REASON = '（理由は述べていない）';
+
+// 推測の元にできる判断か
+export function isJustified(s: Pick<Step, 'summary' | 'evaluation' | 'question'>): boolean {
+  return s.summary?.knowledge === 'domain' && (s.evaluation?.level === 'strong' || s.question?.status === 'answered') && !s.summary.rationale.includes(NO_REASON);
 }
 
 // 論文どおり、Strong を 1 つでも含めば strong、Weak だけなら weak、どちらも無ければ empty

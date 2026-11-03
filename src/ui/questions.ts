@@ -2,13 +2,14 @@
 // - 質問の対象になったコード行・セルの上に「❓」（CodeLens）を出す
 // - ステータスバーに未回答の数を出す
 // - サイドバーの「質問」に一覧を出し、テキストか音声で答える。音声は文字起こしを入力欄に入れ、確かめてから送る
+// - 過去の判断から推測した理由があれば質問に添え、「合っている」「直して答える」「違う」で確かめてもらう
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { where } from '../capture/targets';
 import { Pipeline, type PipelineOptions } from '../pipeline/engine';
 import type { LivePipeline } from '../pipeline/live';
-import type { Anchor, Question, StepSummary } from '../pipeline/steps';
+import type { Anchor, AnswerVia, Inference, PastDecision, Question, StepSummary } from '../pipeline/steps';
 import { openLocation, refreshSessionView } from './sessionView';
 
 export interface VoiceCapture {
@@ -40,6 +41,7 @@ interface Item {
   t0: number;
   question: Question;
   summary?: StepSummary;
+  inference?: Inference;
 }
 
 interface StoredStep {
@@ -47,9 +49,20 @@ interface StoredStep {
   t0: number;
   summary?: StepSummary;
   question?: Question;
+  inference?: Inference;
+}
+
+// 回答を反映する先（記録中は LivePipeline、それ以外は保存済みの結果から読み直した Pipeline）
+interface AnswerTarget {
+  answer(stepId: string, text: string, via: AnswerVia): Promise<unknown>;
+  acceptInference(stepId: string): Promise<unknown>;
+  rejectInference(stepId: string): unknown;
+  dismiss(stepId: string): unknown;
 }
 
 const short = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+const basisLabel = (d: PastDecision) => `${d.session ? `${new Date(d.at).toLocaleDateString('ja-JP')} の記録` : 'この記録'}「${d.decision}」 → ${d.rationale}`;
 
 // 質問の場所がこの文書か。セルは URI で探し、見つからなければノートブックのパスとセル番号で探す（開き直すと URI が変わるため）
 function matches(anchor: Anchor, doc: vscode.TextDocument): boolean {
@@ -99,7 +112,7 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
     const items: Item[] = [];
     const current = this.deps.current();
     const add = (dir: string, startedAt: number, s: StoredStep) => {
-      if (s.question) items.push({ key: `${dir}::${s.id}`, dir, stepId: s.id, startedAt, t0: s.t0, question: s.question, summary: s.summary });
+      if (s.question) items.push({ key: `${dir}::${s.id}`, dir, stepId: s.id, startedAt, t0: s.t0, question: s.question, summary: s.summary, inference: s.inference });
     };
     if (current) for (const s of current.live.pipeline.steps) add(current.dir, current.live.pipeline.origin, s);
     const root = this.deps.sessionsRoot();
@@ -147,7 +160,14 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
       const anchor = i.question.anchor;
       if (i.question.status !== 'open' || !anchor || !matches(anchor, doc)) continue;
       const line = Math.min(Math.max(0, (anchor.line ?? 1) - 1), Math.max(0, doc.lineCount - 1));
-      lenses.push(new vscode.CodeLens(new vscode.Range(line, 0, line, 0), { title: `❓ ClearFairy: ${short(i.question.text, 50)}`, command: 'clearfairy.answerQuestion', arguments: [i.key] }));
+      const guessed = i.inference?.status === 'open';
+      const title =
+        i.question.kind === 'confirm'
+          ? guessed
+            ? `💡 ClearFairy: 前の説明と同じ？「${short(i.inference!.text, 40)}」`
+            : '❓ ClearFairy: この判断の理由は？'
+          : `❓ ClearFairy: ${short(i.question.text, 50)}${guessed ? '（💡 推測あり）' : ''}`;
+      lenses.push(new vscode.CodeLens(new vscode.Range(line, 0, line, 0), { title, command: 'clearfairy.answerQuestion', arguments: [i.key] }));
     }
     return lenses;
   }
@@ -156,7 +176,7 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
     this.view = view;
     view.webview.options = { enableScripts: true };
     view.webview.html = html();
-    view.webview.onDidReceiveMessage((m: { type: string; key?: string; text?: string; via?: 'text' | 'voice' }) => void this.onMessage(m));
+    view.webview.onDidReceiveMessage((m: { type: string; key?: string; text?: string; via?: AnswerVia }) => void this.onMessage(m));
     view.onDidDispose(() => (this.view = undefined));
   }
 
@@ -173,9 +193,12 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
         where: label(i.question.anchor),
         question: i.question.text,
         status: i.question.status,
+        kind: i.question.kind ?? 'ask',
         answer: i.question.answer?.text,
+        via: i.question.answer?.via,
         decision: i.summary?.decision_and_actions,
         rationale: i.summary?.rationale,
+        inference: i.inference && { text: i.inference.text, reasoning: i.inference.reasoning, basis: i.inference.basis.map(basisLabel), status: i.inference.status },
         busy: this.busy.has(i.key),
       })),
       voiceKey: this.voice?.key,
@@ -183,7 +206,7 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
     });
   }
 
-  private async onMessage(m: { type: string; key?: string; text?: string; via?: 'text' | 'voice' }): Promise<void> {
+  private async onMessage(m: { type: string; key?: string; text?: string; via?: AnswerVia }): Promise<void> {
     const item = this.items.find((i) => i.key === m.key);
     switch (m.type) {
       case 'ready':
@@ -199,6 +222,12 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
           await this.update(item, (p) => p.answer(item.stepId, m.text!.trim(), m.via ?? 'text'));
         }
         break;
+      case 'accept':
+        if (item) await this.update(item, (p) => p.acceptInference(item.stepId));
+        break;
+      case 'reject':
+        if (item) await this.update(item, (p) => p.rejectInference(item.stepId));
+        break;
       case 'dismiss':
         if (item) await this.update(item, (p) => p.dismiss(item.stepId));
         break;
@@ -212,16 +241,12 @@ export class QuestionsController implements vscode.Disposable, vscode.CodeLensPr
   }
 
   // 記録中のセッションへの回答は、記録中の処理と順番に反映する
-  private async update(item: Item, apply: (p: { answer: LivePipeline['answer']; dismiss: LivePipeline['dismiss'] }) => Promise<unknown>): Promise<void> {
+  private async update(item: Item, apply: (p: AnswerTarget) => unknown): Promise<void> {
     this.busy.add(item.key);
     this.render();
     try {
       const current = this.deps.current();
-      if (current && current.dir === item.dir) await apply(current.live);
-      else {
-        const p = Pipeline.load(this.deps.pipelineOptions(item.dir));
-        await apply({ answer: (id, text, via) => p.answer(id, text, via), dismiss: async (id) => p.dismiss(id) });
-      }
+      await apply(current && current.dir === item.dir ? current.live : Pipeline.load(this.deps.pipelineOptions(item.dir)));
     } catch (e) {
       this.deps.log.appendLine(`[questions] 回答を反映できなかった: ${e instanceof Error ? (e.stack ?? e.message) : e}`);
       void vscode.window.showErrorMessage(`ClearFairy: 回答を反映できませんでした（${e instanceof Error ? e.message : e}）`);
@@ -308,6 +333,9 @@ function html(): string {
   .empty { color: var(--vscode-descriptionForeground); }
   details summary { cursor: pointer; color: var(--vscode-descriptionForeground); margin-top: 12px; }
   .answer { margin: 4px 0; }
+  .inference { border-left: 3px solid var(--vscode-charts-blue); padding: 2px 8px; margin: 6px 0; background: var(--vscode-textBlockQuote-background); }
+  .inference p { margin: 2px 0; }
+  .inference details summary { margin-top: 2px; font-size: 0.9em; }
 </style>
 </head>
 <body>
@@ -320,6 +348,23 @@ function html(): string {
   const notes = {};
   let state = { items: [] };
   const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const INFERENCE_LABEL = { open: '確かめていない', accepted: '合っている', revised: '直して答えた', rejected: '違う' };
+
+  // 過去の判断からの推測と、その元にした判断
+  function inference(i) {
+    const inf = i.inference;
+    const basis = '<details><summary>元にした過去の判断（' + inf.basis.length + '）</summary>' +
+      inf.basis.map((b) => '<p class="context">・' + esc(b) + '</p>').join('') +
+      (inf.reasoning ? '<p class="context">推測の筋道: ' + esc(inf.reasoning) + '</p>' : '') + '</details>';
+    if (i.status !== 'open') return '<div class="inference"><p class="context">💡 推測（' + INFERENCE_LABEL[inf.status] + '）: ' + esc(inf.text) + '</p>' + basis + '</div>';
+    // 確認だけのときは、上の見出しで「前の説明からの推測」と言っている
+    return '<div class="inference"><p>' + (i.kind === 'confirm' ? '' : '💡 過去の判断からの推測: ') + '<b>' + esc(inf.text) + '</b></p>' + basis +
+      '<div class="buttons">' +
+        '<button data-act="accept"' + (i.busy ? ' disabled' : '') + '>合っている</button>' +
+        '<button class="secondary" data-act="revise"' + (i.busy ? ' disabled' : '') + '>直して答える</button>' +
+        '<button class="secondary" data-act="reject"' + (i.busy ? ' disabled' : '') + '>違う</button>' +
+      '</div></div>';
+  }
 
   function render() {
     const open = state.items.filter((i) => i.status === 'open');
@@ -327,12 +372,16 @@ function html(): string {
     document.getElementById('open').innerHTML = open.length
       ? open.map((i) => {
           const recording = state.voiceKey === i.key;
+          const guessed = i.inference?.status === 'open';
+          // 確認だけの項目は、推測が違ったら理由そのものを聞く
+          const heading = i.kind !== 'confirm' ? '❓ ' + esc(i.question) : guessed ? '💡 ' + esc(i.question) : '❓ 推測は違いました。この判断の理由を教えてください';
           return '<div class="q" data-key="' + esc(i.key) + '">' +
             '<div class="meta">' + esc(i.when) + (i.where ? ' ・ <a data-act="open">' + esc(i.where) + '</a>' : '') + '</div>' +
-            '<p class="question">❓ ' + esc(i.question) + '</p>' +
+            '<p class="question">' + heading + '</p>' +
             (i.decision ? '<p class="context">判断: ' + esc(i.decision) + '</p>' : '') +
             (i.rationale ? '<p class="context">理由: ' + esc(i.rationale) + '</p>' : '') +
-            '<textarea placeholder="理由を書くか、🎤 で話してください">' + esc(drafts[i.key] ?? '') + '</textarea>' +
+            (guessed ? inference(i) : '') +
+            '<textarea placeholder="' + (guessed ? '推測と違う・足りないところを書くか、🎤 で話してください' : '理由を書くか、🎤 で話してください') + '">' + esc(drafts[i.key] ?? '') + '</textarea>' +
             (notes[i.key] ? '<p class="context">' + esc(notes[i.key]) + '</p>' : '') +
             // 記録していないときは音声認識を読み込むのに 1〜2 秒かかり、その間に話した言葉は入らない
             (recording ? '<p class="context">' + (state.voiceReady ? '🔴 聞いています。話し終えたら「■ 話し終えた」を押してください。' : '⏳ 準備しています。🔴 が出てから話してください。') + '</p>' : '') +
@@ -344,11 +393,15 @@ function html(): string {
               '<button class="secondary" data-act="dismiss"' + (i.busy ? ' disabled' : '') + '>答えない</button>' +
             '</div></div>';
         }).join('')
-      : '<p class="empty">未回答の質問はありません。業務・データ固有の判断で理由が弱いとき、ここに質問が出ます。</p>';
+      : '<p class="empty">未回答の質問はありません。業務・データ固有の判断で理由が弱いとき、ここに質問が出ます（前に説明した理由で足りそうなら、推測の確認だけが出ます）。</p>';
     document.getElementById('done').innerHTML = done.length
       ? '<details><summary>答えた・答えなかった質問（' + done.length + '）</summary>' +
         done.map((i) => '<div class="q"><div class="meta">' + esc(i.when) + '</div><p class="question">' + esc(i.question) + '</p>' +
-          (i.status === 'answered' ? '<p class="answer">回答: ' + esc(i.answer) + '</p>' + (i.rationale ? '<p class="context">理由（回答込み）: ' + esc(i.rationale) + '</p>' : '') : '<p class="context">答えなかった</p>') + '</div>').join('') +
+          (i.status === 'answered'
+            ? (i.via === 'inference' ? '<p class="answer">回答: 推測が合っていた</p>' : '<p class="answer">回答: ' + esc(i.answer) + '</p>') +
+              (i.rationale ? '<p class="context">理由（回答込み）: ' + esc(i.rationale) + '</p>' : '')
+            : '<p class="context">答えなかった</p>') +
+          (i.inference ? inference(i) : '') + '</div>').join('') +
         '</details>'
       : '';
   }
@@ -399,6 +452,15 @@ function html(): string {
       vscode.postMessage({ type: 'answer', key, text: drafts[key] ?? '', via: byVoice[key] ? 'voice' : 'text' });
       delete drafts[key];
       delete notes[key];
+    } else if (act === 'revise') {
+      // 推測を入力欄に入れ、直してから送ってもらう
+      const item = state.items.find((i) => i.key === key);
+      drafts[key] = item?.inference?.text ?? '';
+      byVoice[key] = false;
+      render();
+      const box = document.querySelector('.q[data-key="' + CSS.escape(key) + '"] textarea');
+      box?.focus();
+      box?.setSelectionRange(box.value.length, box.value.length);
     } else {
       vscode.postMessage({ type: act, key });
     }

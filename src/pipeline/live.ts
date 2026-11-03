@@ -7,7 +7,7 @@ import type { Action } from '../capture/actions';
 import { persistentDiagnostics } from './actionGroups';
 import { Pipeline, type PipelineOptions } from './engine';
 import { toSentences, type Sentence, type Utterance } from './sentences';
-import type { Step } from './steps';
+import type { AnswerVia, Step } from './steps';
 import type { Window } from './windows';
 
 const MAX_SENTENCES = 10;
@@ -99,8 +99,16 @@ export class LivePipeline {
     return result;
   }
 
-  answer(stepId: string, text: string, via: 'text' | 'voice'): Promise<Step> {
+  answer(stepId: string, text: string, via: AnswerVia): Promise<Step> {
     return this.enqueue(() => this.pipeline.answer(stepId, text, via));
+  }
+
+  acceptInference(stepId: string): Promise<Step> {
+    return this.enqueue(() => this.pipeline.acceptInference(stepId));
+  }
+
+  rejectInference(stepId: string): Promise<void> {
+    return this.enqueue(async () => this.pipeline.rejectInference(stepId));
   }
 
   dismiss(stepId: string): Promise<void> {
