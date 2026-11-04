@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, mock } from 'node:test';
 import type { Action } from '../../src/capture/actions';
+import { SavedAnswers } from '../../src/pipeline/answers';
 import { Pipeline, type PipelineLlm } from '../../src/pipeline/engine';
 import { loadHistory, selectPast } from '../../src/pipeline/history';
 import { LivePipeline } from '../../src/pipeline/live';
 import { Prompts } from '../../src/pipeline/prompts';
 import { toSentences } from '../../src/pipeline/sentences';
-import type { PastDecision, Step } from '../../src/pipeline/steps';
+import { isJustified, type PastDecision, type Step } from '../../src/pipeline/steps';
 import type { Message } from '../../src/llm/llm';
 
 // out/unit/ から見たリポジトリのルート
@@ -62,9 +63,7 @@ describe('処理エンジン', () => {
     p.sentences.push(...sentences);
     const { added } = await p.addWindow({ t0: 1000, t1: 5000, sentences, actions: [edit] });
     assert.equal(added.length, 1);
-    await p.summarize(added);
-    await p.evaluate(added);
-    const asked = await p.askQuestions(added);
+    const asked = await p.analyze(added);
 
     const step = asked[0] as Step;
     assert.equal(step.evaluation?.level, 'empty');
@@ -436,5 +435,165 @@ describe('前の記録の判断', () => {
         ['a', 'st4', 'レジの入力漏れなので除くため'],
       ],
     );
+  });
+});
+
+// 特定のプロンプトだけ times 回失敗する
+const failing = (llm: PipelineLlm, keyword: string, times = Infinity): PipelineLlm => {
+  let failed = 0;
+  return {
+    json: <T>(messages: Message[]) => {
+      if (String((messages[0].content as unknown[])[0]).includes(keyword) && failed < times) {
+        failed++;
+        return Promise.reject(new Error('一時的な失敗'));
+      }
+      return llm.json<T>(messages);
+    },
+  };
+};
+
+// 発話を前のステップの続きとして割り当てる
+const assigningLeft = (llm: PipelineLlm): PipelineLlm => ({
+  json: <T>(messages: Message[]) => {
+    const prompt = String((messages[0].content as unknown[])[0]);
+    if (!prompt.includes('前後どちらのまとまり')) return llm.json<T>(messages);
+    const value = { assignments: [...prompt.matchAll(/対象 (G\d+)/g)].map((m) => ({ group: m[1], direction: 'left' })) } as T;
+    return Promise.resolve({ value, raw: { text: JSON.stringify(value), model: 'fake', ms: 0 } });
+  },
+});
+
+const storedSteps = (dir: string): Step[] => JSON.parse(readFileSync(join(dir, 'steps.json'), 'utf8')).steps;
+
+describe('回答の反映', () => {
+  it('答えた後に次の区切りの発話が合流しても、回答を反映した理由を残す', async () => {
+    const p = new Pipeline({ dir: sessionDir(), prompts, llm: assigningLeft(fakeLlm([])) });
+    const first = toSentences([{ start: 1000, end: 2000, text: '欠損があるな。' }]);
+    p.sentences.push(...first);
+    const { added } = await p.addWindow({ t0: 1000, t1: 5000, sentences: first, actions: [edit] });
+    await p.analyze(added);
+    await p.answer(added[0].id, '欠損は返品なので売上に数えない', 'voice');
+    assert.equal(added[0].summary?.rationale, '欠損は返品なので売上に数えないため');
+
+    const next = toSentences([{ start: 6000, end: 7000, text: '続きを話す。' }], first.length);
+    p.sentences.push(...next);
+    const { changed } = await p.addWindow({ t0: 6000, t1: 7000, sentences: next, actions: [] });
+    assert.deepEqual(changed, added, '前のステップに合流すること');
+    await p.analyze(changed);
+    assert.equal(added[0].summary?.rationale, '欠損は返品なので売上に数えないため');
+    assert.equal(isJustified(added[0]), true, '推測の元からも外れないこと');
+  });
+
+  it('記録を止めた後に同じ記録の質問へ続けて答えても、どちらの回答も残る', async () => {
+    const dir = sessionDir();
+    writeFileSync(join(dir, 'actions.jsonl'), JSON.stringify(edit) + '\n');
+    const options = { dir, prompts, llm: fakeLlm([]) };
+    const p = new Pipeline(options);
+    p.steps.push(questioned('st1', 1000), questioned('st2', 2000));
+    p.save();
+    const target = new SavedAnswers(() => options).target(dir);
+    await Promise.all([target.answer('st1', '返品なので数えない', 'text'), target.answer('st2', '廃棄なので数えない', 'text')]);
+    assert.deepEqual(
+      storedSteps(dir).map((s) => s.question?.answer?.text),
+      ['返品なので数えない', '廃棄なので数えない'],
+    );
+  });
+
+  it('回答の反映に失敗したら未回答のままで、もう一度送れる', async () => {
+    const dir = sessionDir();
+    const past: PastDecision = { session: 's', step: 'st1', at: 0, decision: '返品の行を除いた', rationale: '返品は売上に数えないため' };
+    const p = new Pipeline({ dir, prompts, llm: failing(fakeLlm([]), '回答も踏まえて', 1), retryDelaysMs: [], history: () => [past] });
+    p.steps.push(questioned('st1', 1000));
+    await p.infer(p.steps);
+    p.save();
+    await assert.rejects(p.answer('st1', '返品なので数えない', 'text'));
+    const step = p.steps[0];
+    assert.equal(step.question?.status, 'open');
+    assert.equal(step.question?.answer, undefined);
+    assert.equal(step.inference?.status, 'open');
+    assert.equal(storedSteps(dir)[0].question?.status, 'open');
+
+    await p.answer('st1', '返品なので数えない', 'text');
+    assert.equal(step.question?.status, 'answered');
+    assert.equal(step.inference?.status, 'revised');
+  });
+});
+
+describe('LLM の失敗', () => {
+  const sentenceAndEdit = (live: LivePipeline) => {
+    live.addUtterance({ start: 1000, end: 2000, text: '欠損があるな。' });
+    live.addAction(edit);
+  };
+
+  it('一時的に失敗したら、少し待ってやり直す', async () => {
+    const p = new Pipeline({ dir: sessionDir(), prompts, llm: failing(fakeLlm([]), '意思決定ステップを要約する', 1), retryDelaysMs: [0] });
+    const sentences = toSentences([{ start: 1000, end: 2000, text: '欠損があるな。' }]);
+    p.sentences.push(...sentences);
+    const { added } = await p.addWindow({ t0: 1000, t1: 5000, sentences, actions: [edit] });
+    await p.analyze(added);
+    assert.ok(added[0].summary);
+  });
+
+  it('要約に失敗したステップは残し、後でやり直す', async () => {
+    const dir = sessionDir();
+    const failures: string[] = [];
+    const live = new LivePipeline({ dir, prompts, llm: failing(fakeLlm([]), '意思決定ステップを要約する', 1), retryDelaysMs: [], onFailure: (m) => failures.push(m) });
+    sentenceAndEdit(live);
+    const p = await live.finish();
+    assert.deepEqual(failures, ['一時的な失敗']);
+    assert.equal(p.steps.length, 1);
+    assert.ok(p.steps[0].summary, '要約が作り直されること');
+    assert.ok(p.steps[0].question, '質問まで進むこと');
+    assert.equal(live.unprocessed, 0);
+    assert.ok(storedSteps(dir)[0].summary);
+  });
+
+  it('ステップを作る前に失敗したら、発話と操作を戻してやり直す', async () => {
+    const live = new LivePipeline({ dir: sessionDir(), prompts, llm: failing(fakeLlm([]), '密接に関連する文のまとまり', 1), retryDelaysMs: [] });
+    sentenceAndEdit(live);
+    const p = await live.finish();
+    assert.equal(p.steps.length, 1);
+    assert.equal(p.steps[0].sentences.length, 1);
+    assert.equal(p.steps[0].actionGroups.length, 1);
+    assert.equal(live.unprocessed, 0);
+  });
+
+  it('失敗が続いたら、処理しきれなかった分を数えて知らせる', async () => {
+    const failures: string[] = [];
+    const live = new LivePipeline({ dir: sessionDir(), prompts, llm: failing(fakeLlm([]), '文字起こしを校正する'), retryDelaysMs: [], onFailure: (m) => failures.push(m) });
+    sentenceAndEdit(live);
+    const p = await live.finish();
+    assert.equal(p.steps.length, 0);
+    assert.equal(live.unprocessed, 2);
+    assert.equal(failures.length, 2);
+  });
+
+  it('記録中に失敗したら、しばらくは呼び直さない', async () => {
+    mock.timers.enable({ apis: ['Date', 'setInterval'], now: 0 });
+    try {
+      let calls = 0;
+      const llm: PipelineLlm = {
+        json: () => {
+          calls++;
+          return Promise.reject(new Error('一時的な失敗'));
+        },
+      };
+      const live = new LivePipeline({ dir: sessionDir(), prompts, llm, retryDelaysMs: [] });
+      live.addUtterance({ start: 0, end: 1000, text: '欠損があるな。' });
+      const advance = async (ms: number) => {
+        for (let i = 0; i < ms / 1000; i++) {
+          mock.timers.tick(1000);
+          for (let j = 0; j < 20; j++) await new Promise((r) => setImmediate(r));
+        }
+      };
+      await advance(18_000);
+      assert.equal(calls, 1, '15 秒なにも起きないと区切る');
+      await advance(20_000);
+      assert.equal(calls, 1, 'すぐには呼び直さない');
+      await advance(15_000);
+      assert.equal(calls, 2, '少したつとやり直す');
+      await live.finish();
+    } finally {
+      mock.timers.reset();
+    }
   });
 });

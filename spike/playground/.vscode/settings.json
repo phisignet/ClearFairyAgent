@@ -1,4 +1,7 @@
 {
   // 開発用: 音声認識モデルは、リポジトリの .cache/models（scripts/download-models.sh で取得済み）を使う
-  "clearfairy.speech.modelsDir": "../../.cache/models"
+  "clearfairy.speech.modelsDir": "../../.cache/models",
+  // 開発用: 録音と生のイベントも残す（既定では残さない）
+  "clearfairy.speech.keepAudio": true,
+  "clearfairy.capture.keepEvents": true
 }

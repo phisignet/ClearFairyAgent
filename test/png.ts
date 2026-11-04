@@ -1,4 +1,4 @@
-// Phase 0: 言語モデルに画像を渡せるかを確かめるための、簡単な棒グラフの PNG を作る。
+// テスト用の簡単な棒グラフの PNG を作る。
 // 外部ライブラリを使わない最小の PNG エンコーダ（8bit RGB、フィルタなし）。
 import { deflateSync } from 'node:zlib';
 
@@ -25,7 +25,7 @@ function chunk(type: string, data: Buffer): Buffer {
 
 type Rgb = [number, number, number];
 
-export function encodePng(width: number, height: number, pixel: (x: number, y: number) => Rgb): Uint8Array {
+function encodePng(width: number, height: number, pixel: (x: number, y: number) => Rgb): Uint8Array {
   const row = width * 3 + 1;
   const raw = Buffer.alloc(row * height);
   for (let y = 0; y < height; y++) {

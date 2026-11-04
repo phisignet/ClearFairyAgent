@@ -99,4 +99,4 @@ ClearFairy は、コーディング中の独り言と VS Code の操作から、
 | `images/` | セルの画像出力。`actions.jsonl` の `outputs[].image` がこの記録のフォルダからの相対パス |
 | `answers.jsonl` | 音声の回答の文字起こし。本人が直す前のものなので、回答は `question.answer.text` を見る |
 
-`events.jsonl`（生のイベント）、`pipeline/`（LLM との入出力）、`audio.wav`（録音）は、記録を読むだけなら開かなくてよい。
+`pipeline/`（LLM との入出力）は、記録を読むだけなら開かなくてよい。`events.jsonl`（生のイベント）と `audio.wav`（録音）は、設定で有効にしたときだけあり、これらも開かなくてよい。

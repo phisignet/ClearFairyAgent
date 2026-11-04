@@ -105,10 +105,27 @@ export interface Inference {
 
 export const NO_REASON = '（理由は述べていない）';
 
+// LLM の返した要約を整える。項目が欠けていても後の処理が落ちないようにし、判定が無ければ見落とさないよう業務・データ固有として扱う
+export function normalizeSummary(raw: Partial<StepSummary>, stepType: StepSummary['step_type']): StepSummary {
+  const text = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  return {
+    decision_and_actions: text(raw.decision_and_actions) || '（要約なし）',
+    rationale: text(raw.rationale) || NO_REASON,
+    progression: text(raw.progression),
+    knowledge: raw.knowledge === 'general' ? 'general' : 'domain',
+    step_type: stepType,
+  };
+}
+
 // 推測の元にできる判断か
 export function isJustified(s: Pick<Step, 'summary' | 'evaluation' | 'question'>): boolean {
   return s.summary?.knowledge === 'domain' && (s.evaluation?.level === 'strong' || s.question?.status === 'answered') && !s.summary.rationale.includes(NO_REASON);
 }
+
+export const openQuestionCount = (steps: Pick<Step, 'question'>[]): number => steps.filter((s) => s.question?.status === 'open').length;
+
+// 推測の元にした判断の説明
+export const pastDecisionLabel = (d: PastDecision): string => `${d.session ? `${new Date(d.at).toLocaleDateString('ja-JP')} の記録` : 'この記録'}「${d.decision}」 → ${d.rationale}`;
 
 // 論文どおり、Strong を 1 つでも含めば strong、Weak だけなら weak、どちらも無ければ empty
 export function levelOf(categories: string[]): Evaluation['level'] {

@@ -1,6 +1,6 @@
 // 拡張機能（親）と音声ワーカー（子プロセス）の間でやり取りするメッセージ。
 
-// file はマイクの代わりに WAV を流し込む（試験や、録音を後から処理し直すため）
+// file はマイクの代わりに WAV を流し込む（試験用）
 export type RecorderKind = 'decibri' | 'pvrecorder' | 'file';
 
 export interface StartOptions {
@@ -11,16 +11,18 @@ export interface StartOptions {
   inputWav?: string;
   speed?: number;
   numThreads: number;
-  hotwords?: string;
   // VAD の区間の前後に足す余白（秒）。語頭・語尾の欠けを防ぐ
   padBefore: number;
   padAfter: number;
   // 声の大きさに合わせて、VAD と認識に渡す前に増幅する（initialGainDb は声がたまるまでの初期値）
   autoGain?: boolean;
   initialGainDb?: number;
-  // 指定すると録音を WAV で保存する（検証用）
+  // 指定すると録音を WAV で保存する
   saveWav?: string;
 }
+
+// マイクで聞き取るときの設定。声が小さいと VAD の区間の開始が遅れて語頭が欠けるので、余白を取り、音量も自動で上げる
+export const MIC_OPTIONS = { recorder: 'pvrecorder', padBefore: 1.0, padAfter: 0.2, autoGain: true, initialGainDb: 10 } as const;
 
 export type ToWorker = { type: 'probe' } | { type: 'start'; options: StartOptions } | { type: 'stop' };
 
@@ -33,7 +35,7 @@ export interface ProbeResult {
 
 export type FromWorker =
   | ProbeResult
-  | { type: 'ready'; modelKind: string; loadMs: number; device: string }
+  | { type: 'ready'; device: string }
   // rms は増幅前の音量（マイクが音を拾えているかの確認用）、gainDb はそのときの増幅量
   // speaking: VAD が発話の途中と見ているか（話し終わった言葉が文字になるのを待つため）
   | { type: 'level'; rms: number; gainDb: number; speaking: boolean }

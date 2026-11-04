@@ -2,16 +2,19 @@
 import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { SPEECH_MODELS, settings } from '../config';
-import { sessionsRoot, WorkSession, type SessionInfo } from '../session/session';
-import { ModelStore, type ModelPaths } from '../speech/modelStore';
+import { errorMessage } from '../format';
+import type { SessionInfo } from '../pipeline/records';
+import { prepareSessionsRoot, WorkSession } from '../session/session';
+import { ModelStore } from '../speech/modelStore';
+import { VoiceAnswer, type VoiceCapture } from '../speech/voiceAnswer';
 
 export class SessionController implements vscode.Disposable {
   private session: WorkSession | undefined;
   private starting = false;
+  // 止めている間（マイクを閉じて保存し終えるまで）は、新しい記録を始めない
+  private stopping = false;
   private timer: NodeJS.Timeout | undefined;
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  private readonly changed = new vscode.EventEmitter<void>();
-  readonly onDidChange = this.changed.event;
   // 記録を始めたとき（記録中の処理をつなぐ）
   private readonly startedEmitter = new vscode.EventEmitter<WorkSession>();
   readonly onDidStart = this.startedEmitter.event;
@@ -33,7 +36,11 @@ export class SessionController implements vscode.Disposable {
   }
 
   get busy(): boolean {
-    return this.starting || this.session !== undefined;
+    return this.starting || this.stopping || this.session !== undefined;
+  }
+
+  private get workerScript(): string {
+    return this.context.asAbsolutePath(join('dist', 'speechWorker.js'));
   }
 
   private modelStore(): ModelStore {
@@ -41,9 +48,12 @@ export class SessionController implements vscode.Disposable {
     return new ModelStore(dir);
   }
 
-  // 音声認識モデルの場所（無ければダウンロードを聞く）。記録していないときに音声で答えるのに使う
-  speechModel(): Promise<ModelPaths | undefined> {
-    return this.modelStore().ensure(settings().speechModel);
+  // 質問に音声で答える。記録中なら作業の録音をそのまま使い、記録していなければ回答用に短く録音する
+  async startVoice(onText: (text: string) => void, onError: (message: string) => void): Promise<VoiceCapture> {
+    if (this.session) return this.session.captureAnswer(onText);
+    const model = await this.modelStore().ensure(settings().speechModel);
+    if (!model) throw new Error('音声認識モデルがありません');
+    return VoiceAnswer.start({ workerScript: this.workerScript, model, threads: settings().threads, log: this.log, onText, onError });
   }
 
   async toggle(): Promise<void> {
@@ -60,12 +70,13 @@ export class SessionController implements vscode.Disposable {
       const model = await this.modelStore().ensure(s.speechModel);
       if (!model) return;
       this.session = await WorkSession.start({
-        root: sessionsRoot(this.context),
-        workerScript: this.context.asAbsolutePath(join('dist', 'speechWorker.js')),
+        root: prepareSessionsRoot(this.context),
+        workerScript: this.workerScript,
         model,
         speechModel: s.speechModel,
         threads: s.threads,
         keepAudio: s.keepAudio,
+        keepEvents: s.keepEvents,
         log: this.log,
       });
       this.session.onFail((message) => {
@@ -77,11 +88,10 @@ export class SessionController implements vscode.Disposable {
       this.timer = setInterval(() => this.render(), 500);
       this.startedEmitter.fire(this.session);
     } catch (e) {
-      void vscode.window.showErrorMessage(`ClearFairy: 記録を始められませんでした（${e instanceof Error ? e.message : e}）`);
+      void vscode.window.showErrorMessage(`ClearFairy: 記録を始められませんでした（${errorMessage(e)}）`);
     } finally {
       this.starting = false;
       this.render();
-      this.changed.fire();
     }
   }
 
@@ -89,11 +99,16 @@ export class SessionController implements vscode.Disposable {
     const session = this.session;
     if (!session) return;
     this.session = undefined;
+    this.stopping = true;
     clearInterval(this.timer);
-    this.status.text = '$(loading~spin) 記録を保存しています…';
-    const info = await session.stop();
     this.render();
-    this.changed.fire();
+    let info: SessionInfo;
+    try {
+      info = await session.stop();
+    } finally {
+      this.stopping = false;
+      this.render();
+    }
     const s = info.stats;
     this.log.appendLine(`記録を止めました: ${session.dir}（発話 ${s?.utterances} 件 / 操作 ${s?.actions} 件 / 録音 ${s?.audioSec} 秒）`);
     void vscode.window.showInformationMessage(`ClearFairy: 記録を保存しました（発話 ${s?.utterances} 件・操作 ${s?.actions} 件）`);
@@ -105,6 +120,12 @@ export class SessionController implements vscode.Disposable {
     if (this.starting) {
       this.status.text = '$(loading~spin) ClearFairy: 準備しています…';
       this.status.tooltip = '音声認識モデルを読み込んでいます';
+      return;
+    }
+    if (this.stopping) {
+      this.status.text = '$(loading~spin) 記録を保存しています…';
+      this.status.tooltip = '保存が終わると、新しい記録を始められます';
+      this.status.backgroundColor = undefined;
       return;
     }
     if (!s) {
@@ -126,7 +147,6 @@ export class SessionController implements vscode.Disposable {
     clearInterval(this.timer);
     if (this.session) void this.session.stop();
     this.status.dispose();
-    this.changed.dispose();
     this.startedEmitter.dispose();
     this.stoppedEmitter.dispose();
   }

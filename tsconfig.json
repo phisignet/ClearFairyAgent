@@ -9,7 +9,9 @@
     "noEmit": true,
     "skipLibCheck": true,
     "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "exclude": ["src/webview/questions.ts", "src/webview/sessionView.ts", "test/workspace"]
 }

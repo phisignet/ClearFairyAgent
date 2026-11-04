@@ -4,8 +4,16 @@ import * as vscode from 'vscode';
 import { isNoiseUtterance } from '../pipeline/sentences';
 import { firstLine, SpeechWorker } from './client';
 import type { ModelPaths } from './modelStore';
+import { MIC_OPTIONS } from './protocol';
 
-export class VoiceAnswer {
+// 質問への音声の回答を聞き取っている最中のもの
+export interface VoiceCapture {
+  stop(): Promise<string>;
+  // VAD が発話の途中と見ているか（話している途中で自動で終えないため）
+  readonly speaking: boolean;
+}
+
+export class VoiceAnswer implements VoiceCapture {
   private readonly parts: string[] = [];
   speaking = false;
   private stopping = false;
@@ -37,7 +45,7 @@ export class VoiceAnswer {
       await worker.request(
         {
           type: 'start',
-          options: { modelDir: o.model.modelDir, vadModel: o.model.vadModel, recorder: 'pvrecorder', numThreads: o.threads, padBefore: 1.0, padAfter: 0.2, autoGain: true, initialGainDb: 10 },
+          options: { ...MIC_OPTIONS, modelDir: o.model.modelDir, vadModel: o.model.vadModel, numThreads: o.threads },
         },
         'ready',
         120_000,

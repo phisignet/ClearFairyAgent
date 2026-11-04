@@ -3,10 +3,9 @@
 // 拡張機能のプロセスと分けるのは、sherpa-onnx の decode() が同期処理でイベントループを止めるのと、
 // ネイティブモジュールが異常終了しても拡張機能を巻き込まないため。
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { asrModel, createRecognizer, recognize, SAMPLE_RATE, vadConfig, type AsrModel } from './models';
+import { recognize, recognizerConfig, SAMPLE_RATE, vadConfig, type Recognizer } from './models';
 import type { FromWorker, ProbeResult, RecorderKind, StartOptions, ToWorker } from './protocol';
 
-/* eslint-disable @typescript-eslint/no-require-imports */
 const load = {
   sherpa: () => require('sherpa-onnx-node'),
   decibri: () => require('decibri'),
@@ -215,9 +214,7 @@ class WavFile {
 // ---- 録音 → VAD → 音声認識 ----
 
 class Session {
-  private readonly sherpa = load.sherpa();
-  private readonly model: AsrModel;
-  private readonly recognizer;
+  private readonly recognizer: Recognizer;
   private readonly vad;
   private readonly ring = new Ring(SAMPLE_RATE * RING_SECONDS);
   private pending = new Float32Array(0);
@@ -229,16 +226,13 @@ class Session {
   private readonly wav?: WavFile;
   private readonly gain?: AutoGain;
   private recorder?: Recorder;
-  readonly modelKind: string;
-  readonly loadMs: number;
+  private lastPcm = Date.now();
+  private watchdog?: NodeJS.Timeout;
 
   constructor(private readonly options: StartOptions) {
-    const started = performance.now();
-    this.model = asrModel(options.modelDir, options.numThreads, options.hotwords);
-    this.recognizer = createRecognizer(this.sherpa, this.model);
-    this.vad = new this.sherpa.Vad(vadConfig(options.vadModel), RING_SECONDS);
-    this.modelKind = this.model.kind;
-    this.loadMs = Math.round(performance.now() - started);
+    const sherpa = load.sherpa();
+    this.recognizer = new sherpa.OfflineRecognizer(recognizerConfig(options.modelDir, options.numThreads));
+    this.vad = new sherpa.Vad(vadConfig(options.vadModel), RING_SECONDS);
     if (options.saveWav) this.wav = new WavFile(options.saveWav);
     if (options.autoGain) this.gain = new AutoGain(options.initialGainDb ?? 0);
   }
@@ -253,8 +247,6 @@ class Session {
 
   // マイクが開けても音が届かないことがある（USB ヘッドセットが固まったときなど。PvRecorder も decibri も黙ったままになる）。
   // 認識で止まっている間は届かないので、そのぶんを除いて、音が来ない時間が続いたら知らせる
-  private lastPcm = Date.now();
-  private watchdog?: NodeJS.Timeout;
   private watch(): void {
     this.watchdog = setInterval(() => {
       if (Date.now() - this.lastPcm < NO_AUDIO_MS) return;
@@ -307,7 +299,7 @@ class Session {
       this.prevEnd = segment.start + segment.samples.length;
       const samples = this.ring.slice(from, to);
       const started = performance.now();
-      const text = recognize(this.recognizer, this.model, samples);
+      const text = recognize(this.recognizer, samples);
       const decodeMs = performance.now() - started;
       this.decodeMs += decodeMs;
       this.speechSec += samples.length / SAMPLE_RATE;
@@ -375,7 +367,7 @@ process.on('message', async (msg: ToWorker) => {
       case 'start': {
         session = new Session(msg.options);
         const device = await session.start();
-        await send({ type: 'ready', modelKind: session.modelKind, loadMs: session.loadMs, device });
+        await send({ type: 'ready', device });
         break;
       }
       case 'stop':

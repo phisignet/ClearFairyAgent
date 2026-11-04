@@ -18,6 +18,7 @@ export interface Settings {
   modelsDir: string;
   threads: number;
   keepAudio: boolean;
+  keepEvents: boolean;
   llmModel: string;
 }
 
@@ -31,7 +32,8 @@ export function settings(): Settings {
     speechModel: model in SPEECH_MODELS ? (model as SpeechModelId) : 'whisper-turbo',
     modelsDir: modelsDir && !isAbsolute(modelsDir) && folder ? resolve(folder, modelsDir) : modelsDir,
     threads: c.get<number>('speech.threads', 4),
-    keepAudio: c.get<boolean>('speech.keepAudio', true),
+    keepAudio: c.get<boolean>('speech.keepAudio', false),
+    keepEvents: c.get<boolean>('capture.keepEvents', false),
     llmModel: c.get<string>('llm.model', 'claude-haiku-5.5'),
   };
 }

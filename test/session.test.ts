@@ -2,7 +2,9 @@ import * as assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
-import { WorkSession, type SessionInfo } from '../src/session/session';
+import type { SessionInfo } from '../src/pipeline/records';
+import { prepareSessionsRoot, sessionsRoot, WorkSession } from '../src/session/session';
+import { QuestionsController } from '../src/ui/questions';
 
 // out/test/ から見たリポジトリのルート
 const root = join(__dirname, '..', '..');
@@ -42,8 +44,9 @@ describe('作業セッション', () => {
       speechModel: 'zipformer-ja-en',
       threads: 4,
       keepAudio: true,
+      keepEvents: true,
       log,
-      input: { recorder: 'file', wav: join(root, '.cache', 'testdata', 'tts', 'haruka-desktop.wav'), speed: 4 },
+      input: { wav: join(root, '.cache', 'testdata', 'tts', 'haruka-desktop.wav'), speed: 4, isFocused: () => true },
     });
     await editor.edit((b) => b.replace(new vscode.Range(1, 11, 1, 12), '2'));
     // 音声（約 87 秒）を流し終えるまで待つ
@@ -62,9 +65,33 @@ describe('作業セッション', () => {
     assert.deepEqual(JSON.parse(readFileSync(join(session.dir, 'session.json'), 'utf8')).stats, info.stats);
   });
 
-  it('拡張機能を起動すると、記録の読み方を .clearfairy/README.md に置く', async () => {
+});
+
+describe('記録の場所', () => {
+  const context = { globalStorageUri: vscode.Uri.file(join(root, 'out', 'test-storage')), asAbsolutePath: (p: string) => join(root, p) };
+  const clearfairy = join(vscode.workspace.workspaceFolders![0].uri.fsPath, '.clearfairy');
+  after(() => rmSync(clearfairy, { recursive: true, force: true }));
+
+  it('質問を読むだけでは .clearfairy/ を作らず、記録を始めるときに作って、記録の読み方を置く', async () => {
     await vscode.extensions.getExtension('local.clearfairy-vscode')!.activate();
-    const guide = join(vscode.workspace.workspaceFolders![0].uri.fsPath, '.clearfairy', 'README.md');
-    assert.equal(readFileSync(guide, 'utf8'), readFileSync(join(root, 'skills', 'clearfairy-records', 'SKILL.md'), 'utf8'));
+    rmSync(clearfairy, { recursive: true, force: true });
+    const questions = new QuestionsController({
+      extensionUri: vscode.workspace.workspaceFolders![0].uri,
+      sessionsRoot: () => sessionsRoot(context),
+      pipelineOptions: () => {
+        throw new Error('使わない');
+      },
+      lives: () => new Map(),
+      startVoice: () => Promise.reject(new Error('使わない')),
+      onAnswered: () => {},
+      log: vscode.window.createOutputChannel('ClearFairy (test)'),
+    });
+    questions.refresh();
+    questions.dispose();
+    assert.equal(existsSync(clearfairy), false, 'フォルダを開いただけのワークスペースを汚さないこと');
+
+    assert.equal(prepareSessionsRoot(context), join(clearfairy, 'sessions'));
+    assert.equal(readFileSync(join(clearfairy, '.gitignore'), 'utf8'), '*\n');
+    assert.equal(readFileSync(join(clearfairy, 'README.md'), 'utf8'), readFileSync(join(root, 'skills', 'clearfairy-records', 'SKILL.md'), 'utf8'));
   });
 });

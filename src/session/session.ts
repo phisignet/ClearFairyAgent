@@ -1,34 +1,19 @@
 // 作業セッション: 録音（音声ワーカー）と操作の記録を同時に開始・停止し、.clearfairy/sessions/<日時>/ に保存する。
-// 保存するもの: session.json（概要）、utterances.jsonl（発話ごとの文字起こし）、actions.jsonl（操作）、
-// events.jsonl（生のイベント）、images/（セルの画像出力）、audio.wav（録音。設定で止められる）
+// 保存するもの: session.json（概要）、utterances.jsonl（発話ごとの文字起こし）、actions.jsonl（操作）、images/（セルの画像出力）。
+// 設定で有効にしたときだけ audio.wav（録音）と events.jsonl（生のイベント）も残す
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as vscode from 'vscode';
 import { ActionRecorder } from '../capture/actionRecorder';
 import type { Action } from '../capture/actions';
 import { EventLog } from '../capture/eventLog';
 import type { SpeechModelId } from '../config';
-import { isNoiseUtterance } from '../pipeline/sentences';
+import { writeSessionInfo, type SessionInfo } from '../pipeline/records';
+import { isNoiseUtterance, type Utterance } from '../pipeline/sentences';
 import { firstLine, SpeechWorker } from '../speech/client';
 import type { ModelPaths } from '../speech/modelStore';
-import type { RecorderKind } from '../speech/protocol';
-
-export interface Utterance {
-  start: number;
-  end: number;
-  text: string;
-}
-
-export interface SessionInfo {
-  id: string;
-  startedAt: number;
-  endedAt?: number;
-  workspace?: string;
-  speechModel: SpeechModelId;
-  device?: string;
-  // lostSec: 録音していた時間のうち、マイクから届かなかった音声の秒数
-  stats?: { audioSec: number; speechSec: number; decodeSec: number; lostSec?: number; utterances: number; actions: number };
-}
+import { MIC_OPTIONS } from '../speech/protocol';
+import type { VoiceCapture } from '../speech/voiceAnswer';
 
 export interface StartOptions {
   root: string;
@@ -37,9 +22,10 @@ export interface StartOptions {
   speechModel: SpeechModelId;
   threads: number;
   keepAudio: boolean;
+  keepEvents: boolean;
   log: vscode.OutputChannel;
-  // 試験用: マイクの代わりに WAV を流し込む
-  input?: { recorder: RecorderKind; wav?: string; speed?: number };
+  // 試験用: マイクの代わりに WAV を流し込む。フォーカスの有無も差し替える
+  input?: { wav: string; speed: number; isFocused: () => boolean };
 }
 
 const stamp = () => {
@@ -48,17 +34,20 @@ const stamp = () => {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 };
 
-// 作業レベルの記録はワークスペースの .clearfairy/ に置き、中の .gitignore で git から外す
-export function sessionsRoot(context: vscode.ExtensionContext): string {
-  const root = join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? context.globalStorageUri.fsPath, '.clearfairy');
-  mkdirSync(join(root, 'sessions'), { recursive: true });
-  if (!existsSync(join(root, '.gitignore'))) writeFileSync(join(root, '.gitignore'), '*\n');
-  return join(root, 'sessions');
+// 作業レベルの記録の場所。録音しない人のワークスペースを汚さないよう、ここでは作らない（prepareSessionsRoot）
+export function sessionsRoot(context: Pick<vscode.ExtensionContext, 'globalStorageUri'>): string {
+  return join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? context.globalStorageUri.fsPath, '.clearfairy', 'sessions');
 }
 
-// 記録の読み方を記録の隣に置く。Copilot には chatSkills で渡すが、他のツールには届かないので
-export function writeRecordsGuide(context: vscode.ExtensionContext): void {
-  copyFileSync(context.asAbsolutePath(join('skills', 'clearfairy-records', 'SKILL.md')), join(sessionsRoot(context), '..', 'README.md'));
+// 記録を始めるときに、記録の場所を用意する。中の .gitignore で git から外し、記録の読み方を隣に置く
+// （Copilot には chatSkills で渡すが、他のツールには届かないので）
+export function prepareSessionsRoot(context: Pick<vscode.ExtensionContext, 'globalStorageUri' | 'asAbsolutePath'>): string {
+  const sessions = sessionsRoot(context);
+  const root = dirname(sessions);
+  mkdirSync(sessions, { recursive: true });
+  if (!existsSync(join(root, '.gitignore'))) writeFileSync(join(root, '.gitignore'), '*\n');
+  copyFileSync(context.asAbsolutePath(join('skills', 'clearfairy-records', 'SKILL.md')), join(root, 'README.md'));
+  return sessions;
 }
 
 export class WorkSession {
@@ -84,7 +73,7 @@ export class WorkSession {
     readonly dir: string,
     private readonly worker: SpeechWorker,
     private readonly recorder: ActionRecorder,
-    private readonly events: EventLog,
+    private readonly events: EventLog | undefined,
   ) {}
 
   get onAction(): vscode.Event<Action> {
@@ -95,15 +84,29 @@ export class WorkSession {
     return this.recorder.count;
   }
 
-  // 質問に音声で答え始める。endAnswer() までの発話は回答として扱う
-  beginAnswer(): void {
+  // 質問に音声で答え始める。止めるまでの発話は、作業の文字起こしに入れず回答として扱う
+  captureAnswer(onText: (text: string) => void): VoiceCapture {
     this.answering = [];
+    const sub = this.onAnswerText(onText);
+    const session = this;
+    return {
+      get speaking() {
+        return session.speaking;
+      },
+      stop: async () => {
+        try {
+          return await session.endAnswer();
+        } finally {
+          sub.dispose();
+        }
+      },
+    };
   }
 
   // ボタンを押す直前の言葉も回答に入れるため、VAD が区切って（無音 0.5 秒）文字にし終えるまで待ってから閉じる。
   // 文字にする処理は音声の受け取りと同じ流れで動くので、その後に届く「話していない」通知は、文字にし終えた後に来る
   // 記録を止めた後なら、もう待つものは無い
-  async endAnswer(): Promise<string> {
+  private async endAnswer(): Promise<string> {
     if (!this.stopping) {
       await new Promise((r) => setTimeout(r, 600));
       await new Promise<void>((resolve) => {
@@ -133,17 +136,11 @@ export class WorkSession {
         {
           type: 'start',
           options: {
+            ...MIC_OPTIONS,
+            ...(o.input && { recorder: 'file', inputWav: o.input.wav, speed: o.input.speed }),
             modelDir: o.model.modelDir,
             vadModel: o.model.vadModel,
-            recorder: o.input?.recorder ?? 'pvrecorder',
-            inputWav: o.input?.wav,
-            speed: o.input?.speed,
             numThreads: o.threads,
-            // 声が小さいと VAD の区間の開始が遅れて語頭が欠けるので、余白を取り、音量も自動で上げる（Phase 0 で確認）
-            padBefore: 1.0,
-            padAfter: 0.2,
-            autoGain: true,
-            initialGainDb: 10,
             saveWav: o.keepAudio ? join(dir, 'audio.wav') : undefined,
           },
         },
@@ -155,9 +152,9 @@ export class WorkSession {
       throw e;
     }
     info.device = ready.device;
-    const session = new WorkSession(info, dir, worker, new ActionRecorder(dir), new EventLog(join(dir, 'events.jsonl')));
+    const session = new WorkSession(info, dir, worker, new ActionRecorder(dir, o.input?.isFocused), o.keepEvents ? new EventLog(join(dir, 'events.jsonl')) : undefined);
     session.listen();
-    session.save();
+    writeSessionInfo(dir, info);
     return session;
   }
 
@@ -196,10 +193,6 @@ export class WorkSession {
     });
   }
 
-  private save(): void {
-    writeFileSync(join(this.dir, 'session.json'), JSON.stringify(this.info, null, 2));
-  }
-
   async stop(): Promise<SessionInfo> {
     this.stopping = true;
     let audio: { audioSec: number; speechSec: number; decodeSec: number; lostSec?: number } = { audioSec: 0, speechSec: 0, decodeSec: 0 };
@@ -211,10 +204,10 @@ export class WorkSession {
     this.worker.dispose();
     for (const f of this.quietWaiters.splice(0)) f();
     await this.recorder.stop();
-    this.events.dispose();
+    this.events?.dispose();
     this.info.endedAt = Date.now();
     this.info.stats = { audioSec: audio.audioSec, speechSec: audio.speechSec, decodeSec: audio.decodeSec, lostSec: audio.lostSec, utterances: this.utterances, actions: this.recorder.count };
-    this.save();
+    writeSessionInfo(this.dir, this.info);
     this.utteranceEmitter.dispose();
     this.failEmitter.dispose();
     this.answerEmitter.dispose();

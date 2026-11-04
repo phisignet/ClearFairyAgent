@@ -1,4 +1,4 @@
-// 開発用: 開発ホスト（F5 で開いたウィンドウ）の拡張機能に依頼を出し、結果を待って表示する（src/dev/jobs.ts）。
+// 開発用: 開発ホストの拡張機能に依頼を出し、結果を待って表示する（src/dev/jobs.ts）。
 // 使い方: node scripts/dev-job.mjs <依頼の JSON か、それを書いたファイルのパス> [--workspace spike/playground] [--timeout 300]
 //   例: node scripts/dev-job.mjs '{"type":"ping"}'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';

@@ -1,8 +1,9 @@
 // VSCode の操作イベントを JSONL に生のまま書き出す（作業セッションの events.jsonl）。
-// Phase 0 では手動の編集と AI の編集を見分ける手がかりを調べるのに使い、今は操作のまとめ方を見直すときの元データとして残す。
+// 操作のまとめ方を見直すときの元データで、設定 clearfairy.capture.keepEvents を有効にしたときだけ残す。
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { dirname } from 'node:path';
 import * as vscode from 'vscode';
+import { stripAnsi } from '../format';
 import { isTarget, isTargetUri } from './targets';
 
 const EXCERPT = 200;
@@ -25,9 +26,9 @@ export class EventLog implements vscode.Disposable {
   private readonly visibleTimers = new Map<vscode.TextEditor, NodeJS.Timeout>();
   private readonly terminalOutput = new Map<vscode.TerminalShellExecution, string>();
   private readonly lastDiagnostics = new Map<string, string>();
-  count = 0;
+  private count = 0;
 
-  constructor(readonly file: string) {
+  constructor(file: string) {
     mkdirSync(dirname(file), { recursive: true });
     this.out = createWriteStream(file, { flags: 'a' });
     this.write('log.start', { vscode: vscode.version });
@@ -37,11 +38,6 @@ export class EventLog implements vscode.Disposable {
     this.listenTerminal();
     this.listenDebug();
     this.listenDiagnostics();
-  }
-
-  // 解析しやすいように、ログに目印を入れる（例: 「ここから AI に編集させる」）
-  mark(label: string): void {
-    this.write('mark', { label });
   }
 
   private write(type: string, data: Record<string, unknown> = {}): void {
@@ -195,8 +191,7 @@ export class EventLog implements vscode.Disposable {
       const output = this.terminalOutput.get(e.execution);
       this.terminalOutput.delete(e.execution);
       // 色などの制御文字を除いて末尾だけ残す
-      // eslint-disable-next-line no-control-regex
-      const clean = output?.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, '');
+      const clean = output && stripAnsi(output);
       this.write('terminal.end', { terminal: e.terminal.name, command: e.execution.commandLine.value, exitCode: e.exitCode, outputTail: clean ? excerpt(clean.slice(-500), 500) : undefined });
     });
   }

@@ -11,13 +11,15 @@
 //      質問に添える。前の説明からの推測で足りるなら、質問の代わりに推測の確認だけ出す。回答をもらったら要約を作り直す（prompts/summarize-answer.md）
 //   8. ステップの列を小作業のまとまりに分ける（上の層）              prompts/tasks.md
 // LLM との入出力は <セッション>/pipeline/ に残す。
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Action } from '../capture/actions';
+import { clock, errorMessage } from '../format';
 import type { Message, Part, TextResult } from '../llm/llm';
-import { clock, describeGroup, groupActions, imagesOf, isWeak, type ActionGroup } from './actionGroups';
+import { changedLines, describeGroup, groupActions, imagesOf, isWeak, type ActionGroup } from './actionGroups';
 import { selectPast } from './history';
 import type { Prompts } from './prompts';
+import { readActions, readSentences, readSessionInfo, readSteps, writeSentences, writeSteps, type StoredStep } from './records';
 import type { Sentence } from './sentences';
 import {
   anchorOf,
@@ -27,6 +29,7 @@ import {
   makeGroups,
   makeTasks,
   mergeSteps,
+  normalizeSummary,
   type AnswerVia,
   type Direction,
   type Evaluation,
@@ -50,33 +53,35 @@ export interface PipelineOptions {
   concurrency?: number;
   // 前の記録の、推測の元にできる判断（history.ts）
   history?: () => PastDecision[];
+  // LLM の呼び出しに失敗したときに、やり直すまで待つ時間（数がやり直す回数。テストでは差し替える）
+  retryDelaysMs?: number[];
 }
 
+const DEFAULT_CONCURRENCY = 3;
+const RETRY_DELAYS_MS = [1000, 3000];
 const MAX_LINK_IMAGES = 4;
 // 文字起こしの補正に見せる、前の区切りで直した文の数
 const MAX_PAST_FIXES = 20;
 const MAX_SUMMARY_IMAGES = 2;
 // 推測に見せる過去の判断の数（関係しそうなものと直近のもの。history.ts の selectPast）
 const MAX_PAST = 40;
+// 要約・推測に見せる、ステップの前後の発話の範囲
+const CONTEXT_BEFORE_MS = 180_000;
+const SUMMARY_CONTEXT_AFTER_MS = 120_000;
+const INFER_CONTEXT_AFTER_MS = 60_000;
 // 前の説明からの推測で足りるときに、質問の代わりに出す確認
 const CONFIRM_TEXT = '前に説明した理由から推測しました。合っていますか？';
 
-// 発話や操作が 1 件も無いセッションでは、ファイル自体が無い
-export const readJsonl = <T>(file: string): T[] =>
-  existsSync(file)
-    ? readFileSync(file, 'utf8')
-        .split('\n')
-        .filter(Boolean)
-        .map((l) => JSON.parse(l) as T)
-    : [];
-
+// すべて処理してから、失敗があれば最初のものを投げる（失敗した後に裏で処理が続いて、次の処理と重ならないように）
 async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
+  const errors: unknown[] = [];
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (next < items.length) await fn(items[next++]);
+      while (next < items.length) await fn(items[next++]).catch((e: unknown) => errors.push(e));
     }),
   );
+  if (errors.length > 0) throw errors[0];
 }
 
 // 同じ時間帯に本人が書いたコード・実行したコマンドと、セルの出力に出てきた日本語の語（文字起こしの補正の手がかり）。
@@ -85,7 +90,7 @@ function codeHints(actions: Action[]): string {
   const lines = new Set<string>();
   const words = new Set<string>();
   for (const a of actions) {
-    if (a.kind === 'edit') for (const l of a.diff.split('\n')) if (/^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l)) lines.add(l.slice(1).trim());
+    if (a.kind === 'edit') for (const l of changedLines(a.diff)) lines.add(l.slice(1).trim());
     if (a.kind === 'cell-run') {
       for (const l of a.source.split('\n')) lines.add(l.trim());
       for (const o of a.outputs) if (o.text && o.mime === 'text/plain') for (const w of o.text.match(/[\p{Script=Han}\p{Script=Katakana}\p{Script=Hiragana}ー]{2,}/gu) ?? []) words.add(w);
@@ -96,12 +101,6 @@ function codeHints(actions: Action[]): string {
   const code = [...lines].filter((l) => l.length > 1).slice(0, 100);
   if (words.size > 0) code.push(`（セルの出力に出てきた語: ${[...words].slice(0, 60).join('、')}）`);
   return code.join('\n') || '（なし）';
-}
-
-// steps.json に保存する形（操作は id だけ持つ）
-interface StoredStep extends Omit<Step, 'actionGroups' | 'sentences'> {
-  sentences: Sentence[];
-  actionGroups: { id: string; kind: ActionGroup['kind']; element: string; actions: string[] }[];
 }
 
 export class Pipeline {
@@ -119,7 +118,7 @@ export class Pipeline {
   private questionCount = 0;
 
   constructor(private readonly o: PipelineOptions) {
-    this.origin = (JSON.parse(readFileSync(join(o.dir, 'session.json'), 'utf8')) as { startedAt: number }).startedAt;
+    this.origin = readSessionInfo(o.dir).startedAt;
     this.outDir = join(o.dir, 'pipeline');
     mkdirSync(this.outDir, { recursive: true });
     this.log = o.log ?? (() => {});
@@ -128,9 +127,10 @@ export class Pipeline {
   // 保存済みの結果から作り直す（記録を止めた後に質問へ答えるときなど）
   static load(o: PipelineOptions): Pipeline {
     const p = new Pipeline(o);
-    const actions = new Map(readJsonl<Action>(join(o.dir, 'actions.jsonl')).map((a) => [a.id, a]));
-    const stored = JSON.parse(readFileSync(join(o.dir, 'steps.json'), 'utf8')) as { steps: StoredStep[]; tasks?: Task[] };
-    if (existsSync(join(o.dir, 'sentences.json'))) p.sentences.push(...(JSON.parse(readFileSync(join(o.dir, 'sentences.json'), 'utf8')) as Sentence[]));
+    const stored = readSteps(o.dir);
+    if (!stored) throw new Error(`${o.dir} にはまだ意思決定ステップがない`);
+    const actions = new Map(readActions(o.dir).map((a) => [a.id, a]));
+    p.sentences.push(...readSentences(o.dir));
     for (const s of stored.steps) {
       const actionGroups = s.actionGroups.map((g) => {
         const list = g.actions.map((id) => actions.get(id)).filter((a): a is Action => !!a);
@@ -144,7 +144,7 @@ export class Pipeline {
     return p;
   }
 
-  at(t: number): string {
+  private at(t: number): string {
     return clock(t, this.origin);
   }
 
@@ -152,69 +152,46 @@ export class Pipeline {
     return `${s.id}: [${this.at(s.t0)}] ${s.text}`;
   }
 
-  // LLM を呼び、入出力を pipeline/ に残す
+  private get concurrency(): number {
+    return this.o.concurrency ?? DEFAULT_CONCURRENCY;
+  }
+
+  // LLM を呼び、入出力を pipeline/ に残す。一時的な失敗に備えて、少し待ってやり直す
   private async call<T>(name: string, prompt: string, images: string[] = []): Promise<T> {
     const content: Part[] = [prompt];
     for (const path of images) content.push(`画像 ${path}:`, { image: readFileSync(join(this.o.dir, path)), mime: path.endsWith('.jpg') ? 'image/jpeg' : 'image/png' });
-    const r = await this.o.llm.json<T>([{ role: 'user', content }]);
+    const send = () => this.o.llm.json<T>([{ role: 'user', content }]);
+    let r: { value: T; raw: TextResult } | undefined;
+    for (const delay of this.o.retryDelaysMs ?? RETRY_DELAYS_MS) {
+      try {
+        r = await send();
+        break;
+      } catch (e) {
+        this.log(`  ${name}: 失敗したのでやり直す（${errorMessage(e)}）`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    r ??= await send();
     writeFileSync(join(this.outDir, `${name}.json`), JSON.stringify({ model: r.raw.model, ms: r.raw.ms, images, prompt, response: r.raw.text, value: r.value }, null, 2));
     this.log(`  ${name}: ${r.raw.ms}ms`);
     return r.value;
   }
 
   // 窓 1 つ分を処理してステップを足す（手順 1〜5）。新しいステップと、合流して中身が変わった前のステップを返す。
-  // hints は文字起こしの補正に使うコード（話してから書くこともあるので、分かるなら次の窓の操作も入れる）
+  // hints は文字起こしの補正に使うコード（話してから書くこともあるので、分かるなら次の窓の操作も入れる）。
+  // 途中で失敗したらステップは足さない（同じ窓でやり直せる）
   async addWindow(win: Window, hints: Action[] = win.actions): Promise<{ added: Step[]; changed: Step[] }> {
     const tag = `w${String(++this.windowCount).padStart(2, '0')}`;
     this.log(`窓 ${this.windowCount}（${this.at(win.t0)}〜${this.at(win.t1)}、文 ${win.sentences.length}・操作 ${win.actions.length}）`);
     const kept = await this.correct(win, hints, tag);
     if (kept.length === 0 && win.actions.length === 0) return { added: [], changed: [] };
 
-    // 2. 文のまとめ
-    let groups: SentenceGroup[] = [];
-    if (kept.length > 0) {
-      const r = await this.call<{ groups: string[][] }>(`${tag}-2-group`, this.o.prompts.render('group-sentences', { sentences: kept.map((s) => this.line(s)).join('\n') }));
-      groups = makeGroups(r.groups ?? [], kept, this.groupCount);
-      this.groupCount += groups.length;
-    }
-
-    // 3. 操作のまとめ
+    const groups = await this.groupSentences(kept, tag);
     const actionGroups = groupActions(win.actions, this.actionGroupCount);
     this.actionGroupCount += actionGroups.length;
-
-    // 4. 結び付け
-    const links: Record<string, string[]> = {};
-    if (groups.length > 0 && actionGroups.length > 0) {
-      const r = await this.call<{ links: { group: string; actions: string[] }[] }>(
-        `${tag}-4-link`,
-        this.o.prompts.render('link', {
-          groups: groups.map((g) => `${g.id}:\n${g.sentences.map((s) => `  [${this.at(s.t0)}] ${s.text}`).join('\n')}`).join('\n'),
-          actions: actionGroups.map((g) => describeGroup(g, this.origin)).join('\n'),
-        }),
-        actionGroups.flatMap(imagesOf).slice(-MAX_LINK_IMAGES),
-      );
-      const valid = new Set(actionGroups.map((g) => g.id));
-      for (const l of r.links ?? []) links[l.group] = (l.actions ?? []).filter((a) => valid.has(a));
-    }
-
-    // 5. 操作と結び付かなかった発話（閲覧・エラー表示とだけ結び付いたものを含む）の割り当て。
-    //    窓の先頭のまとまりは、前の窓の最後のステップを left として見せる（窓の境目で判断が割れないように）
-    const assignments: Record<string, Direction> = {};
-    const byGroup = new Map(actionGroups.map((g) => [g.id, g]));
-    const hasStrongLink = (id: string) => (links[id] ?? []).some((a) => !isWeak(byGroup.get(a) ?? { kind: 'view' }));
+    const links = await this.linkActions(groups, actionGroups, tag);
     const previous = this.steps[this.steps.length - 1];
-    const unlinked = groups.map((g, i) => ({ g, i })).filter(({ g }) => !hasStrongLink(g.id));
-    if (unlinked.length > 0) {
-      const text = (g?: SentenceGroup) => (g ? g.sentences.map((s) => s.text).join(' ') : '（なし）');
-      const left = (i: number) =>
-        i > 0 ? `（${groups[i - 1].id}）: ${text(groups[i - 1])}` : previous ? `（前の区切りの最後のステップ）: ${previous.sentences.map((s) => s.text).join(' ') || '（操作だけ）'}` : ': （なし）';
-      const targets = unlinked.map(({ g, i }) => `- 対象 ${g.id}: ${text(g)}\n  left${left(i)}\n  right${groups[i + 1] ? `（${groups[i + 1].id}）` : ''}: ${text(groups[i + 1])}`);
-      const r = await this.call<{ assignments: { group: string; direction: Direction }[] }>(
-        `${tag}-5-assign`,
-        this.o.prompts.render('assign', { transcript: [...(previous?.sentences ?? []), ...kept].map((s) => this.line(s)).join('\n'), targets: targets.join('\n') }),
-      );
-      for (const a of r.assignments ?? []) if (['left', 'right', 'unrelated'].includes(a.direction)) assignments[a.group] = a.direction;
-    }
+    const assignments = await this.assignSentences(groups, actionGroups, links, kept, previous, tag);
 
     const built = buildSteps(groups, actionGroups, links, assignments);
     const changed: Step[] = [];
@@ -254,11 +231,58 @@ export class Pipeline {
       const text = fixed.get(s.id);
       if (text === null || text === undefined || text.trim() === '') s.noise = 'hallucination';
       else if (text !== s.text) {
-        s.original = s.text;
+        // 同じ窓をやり直すときも、最初の文字起こしを残す
+        s.original ??= s.text;
         s.text = text;
       }
     }
     return win.sentences.filter((s) => !s.noise);
+  }
+
+  // 2. 文のまとめ
+  private async groupSentences(kept: Sentence[], tag: string): Promise<SentenceGroup[]> {
+    if (kept.length === 0) return [];
+    const r = await this.call<{ groups: string[][] }>(`${tag}-2-group`, this.o.prompts.render('group-sentences', { sentences: kept.map((s) => this.line(s)).join('\n') }));
+    const groups = makeGroups(r.groups ?? [], kept, this.groupCount);
+    this.groupCount += groups.length;
+    return groups;
+  }
+
+  // 4. 結び付け
+  private async linkActions(groups: SentenceGroup[], actionGroups: ActionGroup[], tag: string): Promise<Record<string, string[]>> {
+    const links: Record<string, string[]> = {};
+    if (groups.length === 0 || actionGroups.length === 0) return links;
+    const r = await this.call<{ links: { group: string; actions: string[] }[] }>(
+      `${tag}-4-link`,
+      this.o.prompts.render('link', {
+        groups: groups.map((g) => `${g.id}:\n${g.sentences.map((s) => `  [${this.at(s.t0)}] ${s.text}`).join('\n')}`).join('\n'),
+        actions: actionGroups.map((g) => describeGroup(g, this.origin)).join('\n'),
+      }),
+      actionGroups.flatMap(imagesOf).slice(-MAX_LINK_IMAGES),
+    );
+    const valid = new Set(actionGroups.map((g) => g.id));
+    for (const l of r.links ?? []) links[l.group] = (l.actions ?? []).filter((a) => valid.has(a));
+    return links;
+  }
+
+  // 5. 操作と結び付かなかった発話（閲覧・エラー表示とだけ結び付いたものを含む）の割り当て。
+  //    窓の先頭のまとまりは、前の窓の最後のステップを left として見せる（窓の境目で判断が割れないように）
+  private async assignSentences(groups: SentenceGroup[], actionGroups: ActionGroup[], links: Record<string, string[]>, kept: Sentence[], previous: Step | undefined, tag: string): Promise<Record<string, Direction>> {
+    const assignments: Record<string, Direction> = {};
+    const byGroup = new Map(actionGroups.map((g) => [g.id, g]));
+    const hasStrongLink = (id: string) => (links[id] ?? []).some((a) => !isWeak(byGroup.get(a) ?? { kind: 'view' }));
+    const unlinked = groups.map((g, i) => ({ g, i })).filter(({ g }) => !hasStrongLink(g.id));
+    if (unlinked.length === 0) return assignments;
+    const text = (g?: SentenceGroup) => (g ? g.sentences.map((s) => s.text).join(' ') : '（なし）');
+    const left = (i: number) =>
+      i > 0 ? `（${groups[i - 1].id}）: ${text(groups[i - 1])}` : previous ? `（前の区切りの最後のステップ）: ${previous.sentences.map((s) => s.text).join(' ') || '（操作だけ）'}` : ': （なし）';
+    const targets = unlinked.map(({ g, i }) => `- 対象 ${g.id}: ${text(g)}\n  left${left(i)}\n  right${groups[i + 1] ? `（${groups[i + 1].id}）` : ''}: ${text(groups[i + 1])}`);
+    const r = await this.call<{ assignments: { group: string; direction: Direction }[] }>(
+      `${tag}-5-assign`,
+      this.o.prompts.render('assign', { transcript: [...(previous?.sentences ?? []), ...kept].map((s) => this.line(s)).join('\n'), targets: targets.join('\n') }),
+    );
+    for (const a of r.assignments ?? []) if (['left', 'right', 'unrelated'].includes(a.direction)) assignments[a.group] = a.direction;
+    return assignments;
   }
 
   private describeSentences(step: Step): string {
@@ -269,24 +293,57 @@ export class Pipeline {
     return step.actionGroups.map((g) => describeGroup(g, this.origin)).join('\n') || '（操作なし）';
   }
 
+  // ステップの前後の発話（要約と推測で、話の流れをつかむために見せる）
+  private transcriptAround(step: Step, afterMs: number): string {
+    const context = this.sentences.filter((s) => !s.noise && s.t0 >= step.t0 - CONTEXT_BEFORE_MS && s.t0 <= step.t1 + afterMs);
+    return context.map((s) => `[${this.at(s.t0)}] ${s.text}`).join('\n') || '（なし）';
+  }
+
+  // 新しいステップと、中身が変わったステップを要約・評価し、質問を作る（手順 6〜7）。質問を作ったステップを返す。
+  // 前に失敗して残ったステップも、ここでやり直す
+  async analyze(touched: Step[]): Promise<Step[]> {
+    await this.summarize(this.steps.filter((s) => touched.includes(s) || !s.summary));
+    await this.evaluate(this.steps.filter((s) => touched.includes(s) || !s.evaluation));
+    return this.askQuestions(this.steps);
+  }
+
   // 6. 要約と、業務・データ固有か一般的なコーディングかの判定
-  async summarize(steps: Step[]): Promise<void> {
-    const clean = this.sentences.filter((s) => !s.noise);
-    await mapLimit(steps, this.o.concurrency ?? 3, async (step) => {
-      const context = clean.filter((s) => s.t0 >= step.t0 - 180_000 && s.t0 <= step.t1 + 120_000);
-      step.summary = await this.call<StepSummary>(
+  private async summarize(steps: Step[]): Promise<void> {
+    await mapLimit(steps, this.concurrency, async (step) => {
+      // 答えた後に中身が変わったら（次の区切りの発話が合流したとき）、回答も踏まえて要約し直す（回答を反映した理由を消さないため）
+      if (step.question?.answer) {
+        step.summary = await this.summarizeAnswer(step, step.question.answer.text);
+        return;
+      }
+      const raw = await this.call<Partial<StepSummary>>(
         `summary-${step.id}`,
         this.o.prompts.render('summarize', {
-          transcript: context.map((s) => `[${this.at(s.t0)}] ${s.text}`).join('\n') || '（なし）',
+          transcript: this.transcriptAround(step, SUMMARY_CONTEXT_AFTER_MS),
           step_sentences: this.describeSentences(step),
           step_actions: this.describeActions(step),
         }),
         step.actionGroups.flatMap(imagesOf).slice(-MAX_SUMMARY_IMAGES),
       );
-      // 判定が無いときは、見落とさないよう業務・データ固有の判断として扱う
-      if (step.summary.knowledge !== 'general') step.summary.knowledge = 'domain';
-      if (step.summary.step_type !== 'check') step.summary.step_type = 'decision';
+      step.summary = normalizeSummary(raw, raw.step_type === 'check' ? 'check' : 'decision');
     });
+  }
+
+  // 回答も踏まえた要約（論文 A.4.2）。shown は質問と並べて見せていた推測
+  private async summarizeAnswer(step: Step, answer: string, shown?: string): Promise<StepSummary> {
+    const raw = await this.call<Partial<StepSummary>>(
+      `answer-${step.id}`,
+      this.o.prompts.render('summarize-answer', {
+        decision: step.summary?.decision_and_actions ?? '',
+        rationale: step.summary?.rationale ?? '',
+        progression: step.summary?.progression ?? '',
+        sentences: this.describeSentences(step),
+        actions: this.describeActions(step),
+        question: step.question?.text ?? '',
+        inference: shown ?? '（なし）',
+        answer,
+      }),
+    );
+    return normalizeSummary(raw, step.summary?.step_type);
   }
 
   // 7a. 業務・データ固有のステップの理由を評価する（一般的なコーディングは評価しない）。
@@ -294,7 +351,7 @@ export class Pipeline {
   //     データの意味を述べた過去の説明として、後の推測に使えるようにするため
   async evaluate(steps: Step[]): Promise<void> {
     const targets = steps.filter((s) => s.summary?.knowledge === 'domain');
-    await mapLimit(targets, this.o.concurrency ?? 3, async (step) => {
+    await mapLimit(targets, this.concurrency, async (step) => {
       let evaluation: Evaluation;
       if (step.sentences.length === 0) {
         evaluation = { categories: ['E'], level: 'empty', reason: '発話が無く、操作だけの判断' };
@@ -376,9 +433,8 @@ export class Pipeline {
     const targets = steps.filter((s) => !s.inference);
     if (targets.length === 0) return [];
     const earlier = this.o.history?.() ?? [];
-    const clean = this.sentences.filter((s) => !s.noise);
     const label = (d: PastDecision) => (d.session ? `前の記録（${new Date(d.at).toLocaleDateString('ja-JP')}）` : `この記録 ${this.at(d.at)}`);
-    await mapLimit(targets, this.o.concurrency ?? 3, async (step) => {
+    await mapLimit(targets, this.concurrency, async (step) => {
       // 同じ記録の前の判断も使う（その場で答えた質問が、次の推測に効く）
       const own = this.steps
         .filter((s) => s !== step && s.t0 < step.t0 && isJustified(s))
@@ -387,11 +443,10 @@ export class Pipeline {
       const query = `${step.summary?.decision_and_actions ?? ''}\n${this.describeSentences(step)}\n${this.describeActions(step)}`;
       const past = selectPast(query, [...earlier, ...own], MAX_PAST);
       if (past.length === 0) return;
-      const context = clean.filter((s) => s.t0 >= step.t0 - 180_000 && s.t0 <= step.t1 + 60_000);
       const r = await this.call<{ inferred_rationale?: string | null; reasoning?: string; basis?: string[] }>(
         `infer-${step.id}`,
         this.o.prompts.render('infer', {
-          transcript: context.map((s) => `[${this.at(s.t0)}] ${s.text}`).join('\n') || '（なし）',
+          transcript: this.transcriptAround(step, INFER_CONTEXT_AFTER_MS),
           decision: step.summary?.decision_and_actions ?? '',
           sentences: this.describeSentences(step),
           actions: this.describeActions(step),
@@ -402,33 +457,22 @@ export class Pipeline {
       // 元にした判断を示せない推測は出さない（本人が確かめようがない）
       const basis = (r.basis ?? []).map((id) => past[Number(/^p(\d+)$/.exec(id)?.[1]) - 1]).filter((d): d is PastDecision => !!d);
       const text = r.inferred_rationale?.trim();
+      // LLM が「推測なし」のつもりで文字列の None を返すことがある
       if (text && text !== 'None' && basis.length > 0) step.inference = { text, reasoning: r.reasoning ?? '', basis, status: 'open', at: Date.now() };
     });
     return targets.filter((s) => s.inference);
   }
 
-  // 回答を受け取り、回答込みで要約を作り直す（論文 A.4.2）。推測を見せていたら、推測も合わせて渡す
+  // 回答を受け取り、回答込みで要約を作り直す。推測を見せていたら、推測も合わせて渡す。
+  // 要約に失敗したら何も変えない（未回答のままなので、もう一度送れる）
   async answer(stepId: string, text: string, via: AnswerVia): Promise<Step> {
     const step = this.steps.find((s) => s.id === stepId);
     if (!step?.question) throw new Error(`質問のあるステップ ${stepId} が見つからない`);
+    const open = step.inference?.status === 'open';
+    step.summary = await this.summarizeAnswer(step, text, open && via !== 'inference' ? step.inference?.text : undefined);
     step.question.status = 'answered';
     step.question.answer = { text, via, at: Date.now() };
-    const shown = step.inference?.status === 'open' && via !== 'inference' ? step.inference.text : undefined;
-    if (step.inference?.status === 'open') step.inference.status = via === 'inference' ? 'accepted' : 'revised';
-    const summary = await this.call<StepSummary>(
-      `answer-${step.id}`,
-      this.o.prompts.render('summarize-answer', {
-        decision: step.summary?.decision_and_actions ?? '',
-        rationale: step.summary?.rationale ?? '',
-        progression: step.summary?.progression ?? '',
-        sentences: this.describeSentences(step),
-        actions: this.describeActions(step),
-        question: step.question.text,
-        inference: shown ?? '（なし）',
-        answer: text,
-      }),
-    );
-    step.summary = { ...summary, knowledge: summary.knowledge === 'general' ? 'general' : 'domain', step_type: step.summary?.step_type };
+    if (step.inference && open) step.inference.status = via === 'inference' ? 'accepted' : 'revised';
     this.save();
     return step;
   }
@@ -475,7 +519,7 @@ export class Pipeline {
         sentences: s.sentences.map(({ id, t0, t1, text, original }) => ({ id, t0, t1, text, original })),
         actionGroups: s.actionGroups.map((g) => ({ id: g.id, kind: g.kind, element: g.element, actions: g.actions.map((a) => a.id) })),
       }));
-    writeFileSync(join(this.o.dir, 'sentences.json'), JSON.stringify(this.sentences, null, 2));
-    writeFileSync(join(this.o.dir, 'steps.json'), JSON.stringify({ version: 3, generatedAt: Date.now(), tasks: this.tasks, steps }, null, 2));
+    writeSentences(this.o.dir, this.sentences);
+    writeSteps(this.o.dir, this.tasks, steps);
   }
 }

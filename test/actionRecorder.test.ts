@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import * as vscode from 'vscode';
 import { ActionRecorder } from '../src/capture/actionRecorder';
 import type { Action, CellRunAction, EditAction, ViewAction } from '../src/capture/actions';
-import { barChartPng } from '../src/spike/png';
+import { barChartPng } from './png';
 
 // .clearfairy/ の中は記録の対象外なので、ワークスペース直下の作業用フォルダを使う（テストの後に消す）
 const dir = join(vscode.workspace.workspaceFolders![0].uri.fsPath, 'test-tmp-actions');
@@ -26,7 +26,6 @@ def summarize(rows):
     return total
 `;
 
-// テストはウィンドウにフォーカスがある前提（手での編集はフォーカスのあるウィンドウでしか起きないため）
 describe('操作のまとめ役（ActionRecorder）', () => {
   before(() => {
     rmSync(dir, { recursive: true, force: true });
@@ -52,7 +51,7 @@ describe('操作のまとめ役（ActionRecorder）', () => {
     const editor = await vscode.window.showTextDocument(vscode.Uri.file(file));
     // ファイルを作ったときのディスクの変更通知は遅れて届くので、外部からの書き換えと見なされないよう落ち着くまで待つ
     await sleep(2500);
-    const recorder = new ActionRecorder(session);
+    const recorder = new ActionRecorder(session, () => true);
     try {
       // summarize の中を 2 回に分けて編集する（3 秒以内なので 1 つにまとまるはず）
       await editor.edit((b) => b.insert(new vscode.Position(6, 0), '    # 合計を出す\n'));
@@ -94,7 +93,7 @@ describe('操作のまとめ役（ActionRecorder）', () => {
     writeFileSync(file, SOURCE);
     const session = join(dir, 'session-view');
     await vscode.window.showTextDocument(vscode.Uri.file(file));
-    const recorder = new ActionRecorder(session);
+    const recorder = new ActionRecorder(session, () => true);
     try {
       // 閲覧として残すのは 3 秒以上。重いときに足りなくならないよう余裕を取る
       await sleep(4500);
@@ -143,7 +142,7 @@ describe('操作のまとめ役（ActionRecorder）', () => {
         }
       }
     };
-    const recorder = new ActionRecorder(session);
+    const recorder = new ActionRecorder(session, () => true);
     try {
       const nb = await vscode.workspace.openNotebookDocument(vscode.Uri.file(file));
       const editor = await vscode.window.showNotebookDocument(nb);

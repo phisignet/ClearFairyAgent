@@ -33,7 +33,7 @@ const FILLER = /^(ん+|うん+|はい|ふう+|ふぅ+|えっと|えーと|えー
 // 同じ文字の 4 回以上の繰り返し（「シィィィィ」「ああああ」）
 const REPEATED = /(.)\1{3,}/;
 
-export const normalizeForNoise = (s: string) => s.replace(/[。、！？!?.,，．\s…・ー〜~「」]/g, '');
+const normalizeForNoise = (s: string) => s.replace(/[。、！？!?.,，．\s…・ー〜~「」]/g, '');
 
 export function noiseOf(text: string): Sentence['noise'] {
   const n = normalizeForNoise(text);

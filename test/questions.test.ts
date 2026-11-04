@@ -40,12 +40,14 @@ describe('確認の質問', () => {
       }),
     );
     controller = new QuestionsController({
+      extensionUri: vscode.workspace.workspaceFolders![0].uri,
       sessionsRoot: () => root,
       pipelineOptions: () => {
         throw new Error('使わない');
       },
-      current: () => undefined,
+      lives: () => new Map(),
       startVoice: () => Promise.reject(new Error('使わない')),
+      onAnswered: () => {},
       log: vscode.window.createOutputChannel('ClearFairy (test)'),
     });
   });

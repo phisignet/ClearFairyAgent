@@ -1,24 +1,23 @@
 // 同じワークスペースの前の記録から、理由の推測に使う過去の判断を集め、今の判断に関係しそうなものを選ぶ。vscode に依存しない。
 // 記録は数分ずつと短いので、同じ記録の中だけでは推測の元になる判断が足りない。
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { isJustified, type PastDecision, type Step } from './steps';
-
-const startedAt = (dir: string) => (JSON.parse(readFileSync(join(dir, 'session.json'), 'utf8')) as { startedAt: number }).startedAt;
+import { readSessionInfo, readSteps } from './records';
+import { isJustified, type PastDecision } from './steps';
 
 // root にある記録のうち、dir の記録より前に始めたものから集める（古い順）
 export function loadHistory(root: string, dir: string): PastDecision[] {
   const self = resolve(dir);
-  const before = existsSync(join(dir, 'session.json')) ? startedAt(dir) : Infinity;
+  const before = existsSync(join(dir, 'session.json')) ? readSessionInfo(dir).startedAt : Infinity;
   const past: PastDecision[] = [];
   if (!existsSync(root)) return past;
   for (const name of readdirSync(root)) {
     const d = join(root, name);
-    if (resolve(d) === self || !existsSync(join(d, 'steps.json'))) continue;
+    if (resolve(d) === self) continue;
     try {
-      if (startedAt(d) >= before) continue;
-      const { steps } = JSON.parse(readFileSync(join(d, 'steps.json'), 'utf8')) as { steps: Step[] };
-      for (const s of steps) if (isJustified(s)) past.push({ session: name, step: s.id, at: s.t0, decision: s.summary!.decision_and_actions, rationale: s.summary!.rationale });
+      const stored = readSteps(d);
+      if (!stored || readSessionInfo(d).startedAt >= before) continue;
+      for (const s of stored.steps) if (isJustified(s)) past.push({ session: name, step: s.id, at: s.t0, decision: s.summary!.decision_and_actions, rationale: s.summary!.rationale });
     } catch {
       // 書きかけの結果などは飛ばす
     }

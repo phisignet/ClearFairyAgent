@@ -20,16 +20,16 @@
 3. 止めると残りを処理し、小作業のまとまりを作る。終わったら「記録を見る」「質問に答える」で開ける（記録を止めた後でも答えられる）
 4. 後から見るときはコマンド「ClearFairy: 記録を見る」、作り直すときは「ClearFairy: 記録から意思決定ステップを作り直す」（回答済みの質問があれば確認する）
 
-記録はワークスペースの `.clearfairy/sessions/<日時>/` に残る（`.clearfairy/` は git に載らない）。
+記録はワークスペースの `.clearfairy/sessions/<日時>/` に残る（`.clearfairy/` は記録を始めるときに作り、git には載らない）。
 
 | ファイル | 中身 |
 |---|---|
 | `session.json` | 概要（開始・終了、モデル、マイク、件数） |
 | `utterances.jsonl` | 発話ごとの文字起こし（実時刻付き） |
 | `actions.jsonl` | 操作（編集・閲覧・セル実行・ターミナル・デバッグ・エラー表示）。型は `src/capture/actions.ts` |
-| `events.jsonl` | 生のイベント（操作のまとめ方を見直すとき用） |
+| `events.jsonl` | 生のイベント（操作のまとめ方を見直すとき用。設定 `clearfairy.capture.keepEvents` を有効にしたときだけ） |
 | `images/` | セルの画像出力 |
-| `audio.wav` | 録音（設定 `clearfairy.speech.keepAudio`） |
+| `audio.wav` | 録音（設定 `clearfairy.speech.keepAudio` を有効にしたときだけ） |
 | `sentences.json` | 文に分けて補正した文字起こし（補正前の文と、除いた雑音の印付き） |
 | `steps.json` | 意思決定ステップ（判断・理由・経緯、理由の評価、確認の質問と回答、過去の判断からの推測と確かめた結果、結び付いた発話・操作）と小作業のまとまり |
 | `answers.jsonl` | 記録中に音声で答えた回答の文字起こし |
@@ -40,7 +40,7 @@
 記録の読み方（場所、各項目の意味、本人の理由として信頼できるのはどれか）を skill にしてある（`skills/clearfairy-records/SKILL.md`）。読み方を教えるだけで、記録を書き換えたり、別の場所に書き出したりはしない。
 
 - **GitHub Copilot**: 拡張機能が skill を渡す。チャットで「前回の作業で何を判断した？」のように聞くと、Copilot が必要と判断したときに読む
-- **その他のエージェント（Claude Code など）**: 同じ内容を、拡張機能の起動時に `.clearfairy/README.md` に置く（毎回上書きする）。「`.clearfairy/README.md` を読んで、前回の作業で何を判断したか教えて」のように渡す
+- **その他のエージェント（Claude Code など）**: 同じ内容を、記録を始めるときに `.clearfairy/README.md` に置く（毎回上書きする）。「`.clearfairy/README.md` を読んで、前回の作業で何を判断したか教えて」のように渡す
 
 ## 話し方（何をどう言えば残るか）
 
@@ -65,6 +65,7 @@ npm install
 npm run build        # dist/ に束ねる（npm run watch で監視）
 npm test             # テスト用の VS Code を別に起動して統合テスト（ログインはしていない。ワークスペースは test/workspace）
 npm run test:unit    # vscode に依存しない処理の単体テスト
+npm run typecheck    # 型チェック（拡張機能の本体と画面のスクリプト）
 bash scripts/download-models.sh sherpa-onnx-whisper-turbo sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17
 # 統合テストで流す読み上げ音声（.cache/testdata/tts/haruka-desktop.wav）を Windows の音声合成で作る
 powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json -OutDir .cache/testdata/tts -Voices 'Microsoft Haruka Desktop'
@@ -85,7 +86,7 @@ powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json
   node scripts/dev-job.mjs '{"type":"openSession","session":"<日時>"}'
   ```
 
-- `spike/playground/` は開発ホストで開く練習用のワークスペース。git に載せているのは設定（`.vscode/settings.json`）、Python 環境（`uv sync --project spike/playground`）、練習用の売上明細を作る `make_sales.py`（`sales_2026.csv` を作る。乱数の種は固定）だけで、練習で作るノートブック・データ・グラフは載せない（`.gitignore`）
+- `spike/playground/` は開発ホストで開く練習用のワークスペース。git に載せているのは設定（`.vscode/settings.json`）、Python 環境（`uv sync --project spike/playground`）、練習用の売上明細を作る `make_sales.py`（`sales_2026.csv` を作る。乱数の種は固定）だけで、練習で作るノートブック・データ・グラフは載せない（`.gitignore`）。設定では、既定では残さない録音と生のイベントも残すようにしてある
 
 ## 構成
 
@@ -95,11 +96,11 @@ powershell -File scripts/make-tts.ps1 -SentencesJson scripts/think-aloud-ja.json
 | `src/capture/` | 操作のまとめ（`actionRecorder.ts`）と生のイベント（`eventLog.ts`） |
 | `src/session/` | 作業セッション（録音と操作の記録を同時に開始・停止して保存） |
 | `src/llm/` | Copilot の言語モデル |
-| `src/pipeline/` | 記録から意思決定ステップを作る処理（論文の CLEAR・要約・理由の評価・質問・理由の推測）。本体は `engine.ts`、止めた後にまとめて処理するのが `run.ts`、記録中に少しずつ処理するのが `live.ts`、推測に使う前の記録の判断を集めるのが `history.ts` |
+| `src/pipeline/` | 記録から意思決定ステップを作る処理（論文の CLEAR・要約・理由の評価・質問・理由の推測）。本体は `engine.ts`、止めた後にまとめて処理するのが `run.ts`、記録中に少しずつ処理するのが `live.ts`、止めた後の回答を反映するのが `answers.ts`、推測に使う前の記録の判断を集めるのが `history.ts`、記録のファイルの読み書きが `records.ts` |
 | `prompts/` | LLM へのプロンプト（毎回ファイルから読むので、拡張機能を読み込み直さずに調整できる） |
 | `skills/` | AI エージェント向けの記録の読み方（Copilot に渡す skill） |
 | `src/ui/` | ステータスバーのボタン、記録を見る画面、確認の質問（`questions.ts`） |
-| `src/dev/` | 開発用の依頼の受け口 |
-| `src/spike/` | Phase 0 の検証用コマンド（手順ページ） |
+| `src/webview/` | 画面で動くスクリプトと、拡張機能とのメッセージの型（画面の CSS は `media/`） |
+| `src/dev/` | 開発用の依頼の受け口（`jobs.ts`）と中身（`handlers.ts`） |
 | `test/` | 統合テスト（`test/unit/` は単体テスト） |
 | `scripts/` | 開発用のスクリプト（モデルの取得、テスト用の読み上げ音声の生成、開発ホストへの依頼） |

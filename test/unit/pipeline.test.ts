@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import type { Action } from '../../src/capture/actions';
 import { describeAction, groupActions, persistentDiagnostics } from '../../src/pipeline/actionGroups';
 import { isNoiseUtterance, noiseOf, toSentences } from '../../src/pipeline/sentences';
-import { buildSteps, makeGroups, makeTasks, type Step } from '../../src/pipeline/steps';
+import { buildSteps, isJustified, makeGroups, makeTasks, NO_REASON, normalizeSummary, type Step } from '../../src/pipeline/steps';
 import { splitWindows } from '../../src/pipeline/windows';
 
 const edit = (id: string, t: number, cell: number, diff = '+x'): Action => ({ kind: 'edit', id, t0: t, t1: t, file: 'a.ipynb', cell, lines: [1, 1], symbols: [], diff, added: 1, removed: 0 });
@@ -57,7 +57,7 @@ describe('操作のまとめ', () => {
   });
 
   it('編集の説明に、変更した行を入れる', () => {
-    const text = describeAction(edit('a1', 0, 13, '@@ -1 +1 @@\n-    # .drop_nulls()\n+    .drop_nulls()'), 0);
+    const text = describeAction(edit('a1', 0, 13, '@@ -1 +1 @@\n-    # .drop_nulls()\n+    .drop_nulls()'));
     assert.match(text, /セル13 を編集/);
     assert.match(text, /\+    \.drop_nulls\(\)/);
   });
@@ -107,6 +107,14 @@ describe('ステップの組み立て', () => {
       steps[0].sentences.map((x) => x.id),
       ['s1', 's2', 's3'],
     );
+  });
+});
+
+describe('LLM の返した要約', () => {
+  it('項目が欠けていても、後の処理が落ちない形にする', () => {
+    const summary = normalizeSummary({ decision_and_actions: ' 欠損行を除いた ' }, 'decision');
+    assert.deepEqual(summary, { decision_and_actions: '欠損行を除いた', rationale: NO_REASON, progression: '', knowledge: 'domain', step_type: 'decision' });
+    assert.equal(isJustified({ summary, evaluation: { categories: ['S-SR'], level: 'strong', reason: '' } }), false);
   });
 });
 

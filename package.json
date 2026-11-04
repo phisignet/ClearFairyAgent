@@ -57,36 +57,6 @@
         "command": "clearfairy.answerQuestion",
         "title": "確認の質問に答える",
         "category": "ClearFairy"
-      },
-      {
-        "command": "clearfairy.spike.openGuide",
-        "title": "確認の手順ページを開く",
-        "category": "ClearFairy (Phase 0)"
-      },
-      {
-        "command": "clearfairy.spike.environment",
-        "title": "環境を確認する",
-        "category": "ClearFairy (Phase 0)"
-      },
-      {
-        "command": "clearfairy.spike.recordAndTranscribe",
-        "title": "録音して文字起こしする",
-        "category": "ClearFairy (Phase 0)"
-      },
-      {
-        "command": "clearfairy.spike.toggleEventLog",
-        "title": "操作ログの記録を開始／停止する",
-        "category": "ClearFairy (Phase 0)"
-      },
-      {
-        "command": "clearfairy.spike.markEventLog",
-        "title": "操作ログに目印を入れる",
-        "category": "ClearFairy (Phase 0)"
-      },
-      {
-        "command": "clearfairy.spike.languageModel",
-        "title": "Copilot の言語モデルを試す",
-        "category": "ClearFairy (Phase 0)"
       }
     ],
     "viewsContainers": {
@@ -115,12 +85,6 @@
         }
       ]
     },
-    "keybindings": [
-      {
-        "command": "clearfairy.spike.markEventLog",
-        "key": "ctrl+alt+m"
-      }
-    ],
     "configuration": {
       "title": "ClearFairy",
       "properties": {
@@ -152,8 +116,13 @@
         },
         "clearfairy.speech.keepAudio": {
           "type": "boolean",
-          "default": true,
-          "description": "録音を WAV としてセッションのフォルダに残す（文字起こしをやり直すときに使う）"
+          "default": false,
+          "description": "録音を WAV としてセッションのフォルダに残す（1 分あたり約 2MB）"
+        },
+        "clearfairy.capture.keepEvents": {
+          "type": "boolean",
+          "default": false,
+          "description": "VS Code の生のイベントをセッションのフォルダに残す（操作のまとめ方を見直すときの元データ）"
         },
         "clearfairy.llm.model": {
           "type": "string",
@@ -166,13 +135,12 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.webview.json",
     "test": "node esbuild.mjs --test && vscode-test",
     "test:unit": "node esbuild.mjs --unit && node --test \"out/unit/*.test.js\""
   },
   "dependencies": {
     "@picovoice/pvrecorder-node": "^1.2.9",
-    "audify": "^1.10.1",
     "decibri": "^5.8.0",
     "diff": "^9.0.0",
     "sherpa-onnx-node": "^2.0.0"

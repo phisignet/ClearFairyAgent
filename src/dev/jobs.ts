@@ -1,4 +1,4 @@
-// 開発用: F5 で開いた開発ホストでだけ、ワークスペースの .clearfairy/dev/jobs/ に置かれた依頼（<id>.job.json）を
+// 開発用: 開発ホストでだけ、ワークスペースの .clearfairy/dev/jobs/ に置かれた依頼（<id>.job.json）を
 // 処理し、結果を <id>.result.json に書く。Copilot の言語モデルはサインイン済みの VS Code の中でしか呼べないので、
 // プロンプトの調整や、録ったセッションの処理し直しを、外（シェル）から頼めるようにするためのもの。ネットワークは開かない。
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';

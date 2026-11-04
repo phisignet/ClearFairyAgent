@@ -1,36 +1,31 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as vscode from 'vscode';
-import type { Action } from './capture/actions';
 import { settings } from './config';
+import { devHandlers } from './dev/handlers';
 import { startDevJobs } from './dev/jobs';
-import { copilotModels } from './llm/copilot';
-import { Llm, type Message, type Part } from './llm/llm';
-import { Pipeline, type PipelineOptions } from './pipeline/engine';
+import { errorDetail, errorMessage } from './format';
+import { Llm } from './llm/llm';
+import type { PipelineLlm, PipelineOptions } from './pipeline/engine';
 import { loadHistory } from './pipeline/history';
 import { LivePipeline } from './pipeline/live';
 import { Prompts } from './pipeline/prompts';
-import { runPipeline, type PipelineResult } from './pipeline/run';
-import type { Step } from './pipeline/steps';
-import { sessionsRoot, writeRecordsGuide, type SessionInfo } from './session/session';
-import { VoiceAnswer } from './speech/voiceAnswer';
-import { registerSpikeCommands } from './spike/commands';
+import { readSessionInfo, readSteps } from './pipeline/records';
+import { runPipeline } from './pipeline/run';
+import { openQuestionCount, type Step } from './pipeline/steps';
+import { sessionsRoot } from './session/session';
 import { QuestionsController } from './ui/questions';
 import { SessionController } from './ui/sessionControls';
-import { openSessionView, refreshSessionView } from './ui/sessionView';
+import { SessionViews } from './ui/sessionView';
 
 export function activate(context: vscode.ExtensionContext): void {
   const log = vscode.window.createOutputChannel('ClearFairy');
-  try {
-    writeRecordsGuide(context);
-  } catch (e) {
-    log.appendLine(`記録の読み方を置けませんでした: ${e}`);
-  }
   const controller = new SessionController(context, log);
   const llm = new Llm(() => settings().llmModel);
   const prompts = new Prompts(context.asAbsolutePath('prompts'));
+  const views = new SessionViews(context.extensionUri);
 
-  const pipelineOptions = (dir: string, target = llm, onLog?: (m: string) => void): PipelineOptions => ({
+  const pipelineOptions = (dir: string, target: PipelineLlm = llm, onLog?: (m: string) => void): PipelineOptions => ({
     dir,
     prompts,
     llm: target,
@@ -41,130 +36,105 @@ export function activate(context: vscode.ExtensionContext): void {
     // 理由の推測には、同じワークスペースの前の記録の判断も使う
     history: () => loadHistory(sessionsRoot(context), dir),
   });
-  const run = (dir: string, target = llm, onLog?: (m: string) => void): Promise<PipelineResult> => runPipeline(pipelineOptions(dir, target, onLog));
 
-  // 記録中のセッションの逐次処理
-  let live: { dir: string; live: LivePipeline } | undefined;
+  // 記録中と、止めた後の処理が終わっていないセッションの逐次処理
+  const lives = new Map<string, LivePipeline>();
 
   const questions = new QuestionsController({
+    extensionUri: context.extensionUri,
     sessionsRoot: () => sessionsRoot(context),
     pipelineOptions: (dir) => pipelineOptions(dir),
-    current: () => live,
-    // 記録中は作業の録音をそのまま使い、記録していなければ回答用に短く録音する
-    startVoice: async (onText, onError) => {
-      const session = controller.current;
-      if (session) {
-        session.beginAnswer();
-        const sub = session.onAnswerText(onText);
-        return {
-          get speaking() {
-            return session.speaking;
-          },
-          stop: async () => {
-            try {
-              return await session.endAnswer();
-            } finally {
-              sub.dispose();
-            }
-          },
-        };
-      }
-      const model = await controller.speechModel();
-      if (!model) throw new Error('音声認識モデルがありません');
-      return VoiceAnswer.start({ workerScript: context.asAbsolutePath(join('dist', 'speechWorker.js')), model, threads: settings().threads, log, onText, onError });
-    },
+    lives: () => lives,
+    startVoice: (onText, onError) => controller.startVoice(onText, onError),
+    onAnswered: (dir) => views.refresh(dir),
     log,
   }).register();
 
-  const openCount = (steps: Step[]) => steps.filter((s) => s.question?.status === 'open').length;
+  const reportFailure = (e: unknown) => {
+    log.appendLine(`[pipeline] 失敗: ${errorDetail(e)}`);
+    void vscode.window.showErrorMessage(`ClearFairy: 意思決定ステップを作れませんでした（${errorMessage(e)}）`);
+  };
 
-  // 終わったら、見るかどうかを聞く
-  const offerView = async (dir: string, steps: Step[]) => {
-    const open = openCount(steps);
+  // 終わったら、見るかどうかを聞く。partial: 処理しきれなかった分が残っている
+  const offerView = async (dir: string, steps: Step[], partial = false) => {
+    const open = openQuestionCount(steps);
     const actions = open > 0 ? ['質問に答える', '記録を見る'] : ['記録を見る'];
-    const answer = await vscode.window.showInformationMessage(
-      `ClearFairy: 意思決定ステップを ${steps.length} 個作りました${open > 0 ? `（確認の質問 ${open} 件）` : ''}`,
-      ...actions,
-    );
-    if (answer === '記録を見る') openSessionView(dir);
+    const message = `ClearFairy: 意思決定ステップを ${steps.length} 個作りました${open > 0 ? `（確認の質問 ${open} 件）` : ''}${partial ? '。一部は処理しきれませんでした。「記録から意思決定ステップを作り直す」でやり直せます' : ''}`;
+    const answer = await (partial ? vscode.window.showWarningMessage(message, ...actions) : vscode.window.showInformationMessage(message, ...actions));
+    if (answer === '記録を見る') views.open(dir);
     if (answer === '質問に答える') await vscode.commands.executeCommand('clearfairy.showQuestions');
   };
 
   // 記録からステップを作り直す
   const processSession = async (dir: string): Promise<void> => {
-    if (live?.dir === dir) {
-      void vscode.window.showWarningMessage('ClearFairy: 記録中のセッションは作り直せません。記録を止めてから実行してください。');
+    if (lives.has(dir)) {
+      void vscode.window.showWarningMessage('ClearFairy: 記録中のセッションは作り直せません。記録を止めて、処理が終わってから実行してください。');
       return;
     }
-    if (existsSync(join(dir, 'steps.json'))) {
-      const { steps } = JSON.parse(readFileSync(join(dir, 'steps.json'), 'utf8')) as { steps: Step[] };
-      const answered = steps.filter((s) => s.question?.status === 'answered').length;
-      if (answered > 0) {
-        const ok = await vscode.window.showWarningMessage(
-          `この記録には回答済みの質問が ${answered} 件あります。作り直すと、回答を反映した要約と質問は作り直されます（回答の文字起こしは answers.jsonl に残ります）。`,
-          { modal: true },
-          '作り直す',
-        );
-        if (!ok) return;
-      }
+    const answered = readSteps(dir)?.steps.filter((s) => s.question?.status === 'answered').length ?? 0;
+    if (answered > 0) {
+      const ok = await vscode.window.showWarningMessage(`この記録には回答済みの質問が ${answered} 件あります。作り直すと、回答と、回答を反映した理由は消えます。`, { modal: true }, '作り直す');
+      if (!ok) return;
     }
     try {
-      const r = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'ClearFairy: 記録から意思決定ステップを作っています' },
-        (progress) => run(dir, llm, (m) => progress.report({ message: m })),
+      const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'ClearFairy: 記録から意思決定ステップを作っています' }, (progress) =>
+        runPipeline(pipelineOptions(dir, llm, (m) => progress.report({ message: m }))),
       );
       questions.refresh();
       await offerView(dir, r.steps);
     } catch (e) {
-      log.appendLine(`[pipeline] 失敗: ${e instanceof Error ? (e.stack ?? e.message) : e}`);
-      void vscode.window.showErrorMessage(`ClearFairy: 意思決定ステップを作れませんでした（${e instanceof Error ? e.message : e}）`);
+      reportFailure(e);
     }
   };
 
   // 記録を始めたら、たまった発話と操作から少しずつステップを作り、質問を出す
   controller.onDidStart((session) => {
+    let warned = false;
     const l = new LivePipeline({
       ...pipelineOptions(session.dir),
       // 質問を早く出すため、記録中は要約などを多めに並べて呼ぶ
       concurrency: 6,
       onChange: () => {
         questions.refresh();
-        refreshSessionView(session.dir);
+        views.refresh(session.dir);
+      },
+      // 作業の邪魔にならないよう、記録の中で 1 回だけ知らせる
+      onFailure: (message) => {
+        if (warned) return;
+        warned = true;
+        void vscode.window.showWarningMessage(`ClearFairy: 言語モデルの呼び出しに失敗しました。少し後でやり直します（${message}）`);
       },
     });
     session.onUtterance((u) => l.addUtterance(u));
     session.onAction((a) => l.addAction(a));
-    live = { dir: session.dir, live: l };
+    lives.set(session.dir, l);
     questions.refresh();
   });
 
   // 止めたら残りを処理して、小作業のまとまりを作る
   const finishSession = async (dir: string): Promise<void> => {
-    const current = live;
-    if (current?.dir !== dir) return processSession(dir);
+    const live = lives.get(dir);
+    if (!live) return processSession(dir);
+    let steps: Step[] | undefined;
     try {
-      const p = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'ClearFairy: 残りの記録から意思決定ステップを作っています' },
-        () => current.live.finish(),
-      );
-      if (live === current) live = undefined;
-      questions.refresh();
-      await offerView(dir, p.steps);
+      steps = (await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'ClearFairy: 残りの記録から意思決定ステップを作っています' }, () => live.finish())).steps;
     } catch (e) {
-      if (live === current) live = undefined;
-      log.appendLine(`[pipeline] 失敗: ${e instanceof Error ? (e.stack ?? e.message) : e}`);
-      void vscode.window.showErrorMessage(`ClearFairy: 意思決定ステップを作れませんでした（${e instanceof Error ? e.message : e}）`);
+      reportFailure(e);
     }
+    const partial = live.unprocessed > 0;
+    lives.delete(dir);
+    questions.refresh();
+    if (steps) await offerView(dir, steps, partial);
   };
 
   // 記録したセッションを新しい順に選ぶ
   const pickSession = async (placeHolder: string): Promise<string | undefined> => {
     const root = sessionsRoot(context);
-    const items = readdirSync(root, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && existsSync(join(root, d.name, 'session.json')))
+    const names = existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && existsSync(join(root, d.name, 'session.json'))) : [];
+    const items = names
       .map((d) => {
         const dir = join(root, d.name);
-        const info = JSON.parse(readFileSync(join(dir, 'session.json'), 'utf8')) as SessionInfo;
+        const info = readSessionInfo(dir);
         const minutes = info.endedAt ? Math.round((info.endedAt - info.startedAt) / 60000) : 0;
         const processed = existsSync(join(dir, 'steps.json'));
         return {
@@ -191,7 +161,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('clearfairy.stopSession', () => controller.stop()),
     vscode.commands.registerCommand('clearfairy.openSession', async () => {
       const dir = await pickSession('見る記録を選ぶ');
-      if (dir) openSessionView(dir);
+      if (dir) views.open(dir);
     }),
     vscode.commands.registerCommand('clearfairy.processSession', async () => {
       const dir = await pickSession('意思決定ステップを作り直す記録を選ぶ');
@@ -203,161 +173,9 @@ export function activate(context: vscode.ExtensionContext): void {
       void finishSession(dir);
     }),
   );
-  registerSpikeCommands(context);
 
-  // 開発ホストでだけ動く、外からの依頼の受け口（src/dev/jobs.ts）
-  const jobs = startDevJobs(context, log, {
-    ping: async () => ({
-      vscode: vscode.version,
-      extension: (context.extension.packageJSON as { version: string }).version,
-      recording: controller.busy,
-      session: controller.current?.dir,
-      openQuestions: questions.openCount,
-    }),
-    reload: async () => {
-      if (controller.busy) throw new Error('記録中なので読み込み直さない');
-      setTimeout(() => void vscode.commands.executeCommand('workbench.action.reloadWindow'), 300);
-      return 'reloading';
-    },
-    models: async () => (await copilotModels()).map((m) => ({ id: m.id, family: m.family, name: m.name, maxInputTokens: m.maxInputTokens })),
-    // messages の content には文字列か、{ "imageFile": "<パス>", "mime": "image/png" } を並べられる
-    llm: async (job) => {
-      type JobPart = string | { imageFile: string; mime?: string };
-      const messages: Message[] = (job.messages as { role: 'user' | 'assistant'; content: string | JobPart[] }[]).map((m) => ({
-        role: m.role,
-        content:
-          typeof m.content === 'string'
-            ? m.content
-            : m.content.map((p): Part => (typeof p === 'string' ? p : { image: readFileSync(p.imageFile), mime: p.mime ?? 'image/png' })),
-      }));
-      const model = typeof job.model === 'string' ? job.model : undefined;
-      const target = model ? new Llm(() => model) : llm;
-      return job.json ? target.json(messages) : target.text(messages);
-    },
-    // 記録したセッションから意思決定ステップを作る（{ "session": "<id>", "model"?: "<id か family>" }）。
-    // "copy": true なら .clearfairy/dev/rerun-<id>/ に写して作り直す（元の結果と回答は変えず、質問の一覧にも出さない）
-    pipeline: async (job) => {
-      const model = typeof job.model === 'string' ? job.model : undefined;
-      const src = join(sessionsRoot(context), String(job.session));
-      let dir = src;
-      if (job.copy) {
-        dir = join(sessionsRoot(context), '..', 'dev', `rerun-${job.session}`);
-        rmSync(dir, { recursive: true, force: true });
-        cpSync(src, dir, { recursive: true, filter: (f) => !/[\\/](steps\.json|sentences\.json|pipeline)$/.test(f) });
-      }
-      const r = await runPipeline({ ...pipelineOptions(dir, model ? new Llm(() => model) : llm), history: () => loadHistory(sessionsRoot(context), src) });
-      if (!job.copy) questions.refresh();
-      return {
-        ms: r.ms,
-        steps: r.steps.length,
-        kinds: r.steps.reduce<Record<string, number>>((m, s) => ((m[s.kind] = (m[s.kind] ?? 0) + 1), m), {}),
-        noise: r.sentences.filter((s) => s.noise).length,
-        corrected: r.sentences.filter((s) => s.original).length,
-        questions: openCount(r.steps),
-        domain: r.steps
-          .filter((s) => s.summary?.knowledge === 'domain')
-          .map((s) => ({ step: s.id, type: s.summary?.step_type, level: s.evaluation?.level, decision: s.summary?.decision_and_actions, kind: s.question?.kind, question: s.question?.text, inferred: s.inference?.text, skip: s.questionSkipped })),
-      };
-    },
-    // 質問だけ作り直す（{ "session": "<id>" }）。未回答の質問と、質問しなかった判断を考え直す
-    // "all": true なら答えた質問も作り直す。"dry": true なら保存しない（前の記録の説明で聞き直しが減るかを見るときなど）
-    questions: async (job) => {
-      const p = Pipeline.load(pipelineOptions(join(sessionsRoot(context), String(job.session))));
-      for (const s of p.steps) {
-        if (s.question?.status === 'open' || (job.all && s.question)) {
-          s.question = undefined;
-          s.inference = undefined;
-        }
-        s.questionSkipped = undefined;
-      }
-      await p.askQuestions(p.steps);
-      if (!job.dry) {
-        p.save();
-        questions.refresh();
-      }
-      return p.steps
-        .filter((s) => s.summary?.knowledge === 'domain' && s.evaluation?.level !== 'strong')
-        .map((s) => ({
-          step: s.id,
-          level: s.evaluation?.level,
-          decision: s.summary?.decision_and_actions,
-          kind: s.question?.kind,
-          question: s.question?.text,
-          inferred: s.inference?.text,
-          basis: s.inference?.basis.map((b) => `${b.session ?? 'この記録'} ${b.step}: ${b.rationale}`),
-          skip: s.questionSkipped,
-        }));
-    },
-    // 質問を出した判断の理由を、過去の判断から推測する（{ "session": "<id>", "step"?: "<ステップ id>" }）。結果は保存しない。
-    // 実際の回答と並べて返す（推測の当たり外れを見るため。推測には回答を渡さない）
-    infer: async (job) => {
-      const dir = join(sessionsRoot(context), String(job.session));
-      const p = Pipeline.load(pipelineOptions(dir));
-      const results = [];
-      for (const s of p.steps.filter((x) => x.question && (!job.step || x.id === job.step))) {
-        const { question, inference } = s;
-        s.inference = undefined;
-        const file = join(dir, 'pipeline', `infer-${s.id}.json`);
-        rmSync(file, { force: true });
-        const got = (await p.infer([s]))[0]?.inference;
-        const raw = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as { value: { reasoning?: string } }).value : undefined;
-        results.push({
-          step: s.id,
-          question: question!.text,
-          answer: question!.answer?.text,
-          inferred: got?.text ?? null,
-          reasoning: got?.reasoning ?? raw?.reasoning ?? '（推測の元にできる過去の判断が無い）',
-          basis: got?.basis.map((b) => `${b.session ?? 'この記録'} ${b.step}: ${b.rationale}`),
-        });
-        s.inference = inference;
-      }
-      return results;
-    },
-    // 質問に答える（{ "session": "<id>", "step": "<ステップ id>", "text": "<回答>" }）
-    answer: async (job) => {
-      const p = Pipeline.load(pipelineOptions(join(sessionsRoot(context), String(job.session))));
-      const step = await p.answer(String(job.step), String(job.text), 'text');
-      questions.refresh();
-      return step.summary;
-    },
-    // 記録した発話と操作を、元の間隔のまま記録中の処理に流し直す（{ "session": "<id>" }）。
-    // 質問がどれだけ遅れて出るかを、実際の LLM で測る。結果は .clearfairy/dev/replay-<id>/ に置き、質問の一覧には出さない
-    replay: async (job) => {
-      const src = join(sessionsRoot(context), String(job.session));
-      const dir = join(sessionsRoot(context), '..', 'dev', `replay-${job.session}`);
-      rmSync(dir, { recursive: true, force: true });
-      mkdirSync(dir, { recursive: true });
-      if (existsSync(join(src, 'images'))) cpSync(join(src, 'images'), join(dir, 'images'), { recursive: true });
-      const info = JSON.parse(readFileSync(join(src, 'session.json'), 'utf8')) as SessionInfo;
-      const shift = Date.now() + 1000 - info.startedAt;
-      writeFileSync(join(dir, 'session.json'), JSON.stringify({ ...info, startedAt: info.startedAt + shift }));
-      const lines = (f: string) => (existsSync(join(src, f)) ? readFileSync(join(src, f), 'utf8').split('\n').filter(Boolean) : []);
-      // 推測に使う過去の判断は、流し直す記録より前のものだけ（流し直しの記録は今の時刻で始まったことになるため）
-      const l = new LivePipeline({ ...pipelineOptions(dir), concurrency: 6, history: () => loadHistory(sessionsRoot(context), src) });
-      const events = [
-        ...lines('utterances.jsonl').map((x) => {
-          const u = JSON.parse(x) as { start: number; end: number; text: string };
-          return { t: u.end + shift, add: () => l.addUtterance({ ...u, start: u.start + shift, end: u.end + shift }) };
-        }),
-        ...lines('actions.jsonl').map((x) => {
-          const a = JSON.parse(x) as Action;
-          return { t: a.t1 + shift, add: () => l.addAction({ ...a, t0: a.t0 + shift, t1: a.t1 + shift }) };
-        }),
-      ];
-      await Promise.all(events.map((e) => new Promise<void>((r) => setTimeout(() => (e.add(), r()), Math.max(0, e.t - Date.now())))));
-      await new Promise((r) => setTimeout(r, Math.max(0, (info.endedAt ?? 0) + shift - Date.now())));
-      const p = await l.finish();
-      const at = (t: number) => Math.round((t - info.startedAt - shift) / 1000);
-      return p.steps
-        .filter((s) => s.question)
-        .map((s) => ({ step: s.id, from: at(s.t0), to: at(s.t1), asked: at(s.question!.createdAt), delay: at(s.question!.createdAt) - at(s.t1), question: s.question!.text }));
-    },
-    // 記録の画面を開く（{ "session": "<id>" }）
-    openSession: async (job) => {
-      openSessionView(join(sessionsRoot(context), String(job.session)));
-      return 'opened';
-    },
-  });
+  // 開発ホストでだけ動く、外からの依頼の受け口（src/dev/）
+  const jobs = startDevJobs(context, log, devHandlers({ context, controller, questions, views, llm, pipelineOptions }));
   if (jobs) context.subscriptions.push(jobs);
 }
 

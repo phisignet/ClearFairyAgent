@@ -2,6 +2,7 @@
 // 論文は「同じ要素への同じ種類の連続した操作」だけをまとめる方式（GAv3）が最良だった。
 // コーディングでは「要素」を、ノートブックならセル、.py なら関数（無ければファイル）とする。
 import type { Action } from '../capture/actions';
+import { clock, locationLabel } from '../format';
 
 export interface ActionGroup {
   id: string;
@@ -13,7 +14,7 @@ export interface ActionGroup {
 }
 
 // 操作の対象（要素）
-export function elementOf(a: Action): string {
+function elementOf(a: Action): string {
   switch (a.kind) {
     case 'edit':
       return a.cell !== undefined ? `${a.file}#${a.cell}` : `${a.file}:${a.symbols[0] ?? ''}`;
@@ -64,24 +65,17 @@ export function groupActions(actions: Action[], startIndex = 0): ActionGroup[] {
   return groups;
 }
 
-export const clock = (t: number, origin: number) => {
-  const s = Math.max(0, Math.round((t - origin) / 1000));
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-};
+// 差分の変更した行（差分には今の形式ではファイル名の行が無いので、先頭の +/- だけで見分ける）
+export const changedLines = (diff: string): string[] => diff.split('\n').filter((l) => /^[+-]/.test(l));
 
-const changedLines = (diff: string, max: number) => {
-  const lines = diff.split('\n').filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l));
-  return lines.length > max ? [...lines.slice(0, max), `…（ほか ${lines.length - max} 行）`] : lines;
-};
-
-const where = (file: string, cell?: number) => (cell !== undefined ? `${file} のセル${cell}` : file);
+const shortened = (lines: string[], max: number) => (lines.length > max ? [...lines.slice(0, max), `…（ほか ${lines.length - max} 行）`] : lines);
 
 // 操作 1 つを、LLM に渡す説明にする
-export function describeAction(a: Action, origin: number, maxLines = 8): string {
+export function describeAction(a: Action, maxLines = 8): string {
   switch (a.kind) {
     case 'edit': {
       const sym = a.symbols.length ? `（${a.symbols.join(', ')}）` : '';
-      return [`${where(a.file, a.cell)}${sym} を編集（${a.lines[0]}〜${a.lines[1]}行、+${a.added}/-${a.removed}${a.undo ? '、元に戻すを含む' : ''}）`, ...changedLines(a.diff, maxLines).map((l) => `    ${l}`)].join('\n');
+      return [`${locationLabel(a.file, a.cell)}${sym} を編集（${a.lines[0]}〜${a.lines[1]}行、+${a.added}/-${a.removed}${a.undo ? '、元に戻すを含む' : ''}）`, ...shortened(changedLines(a.diff), maxLines).map((l) => `    ${l}`)].join('\n');
     }
     case 'cell-run': {
       const outputs = a.outputs
@@ -91,7 +85,7 @@ export function describeAction(a: Action, origin: number, maxLines = 8): string 
         .split('\n')
         .map((l) => `    ${l}`)
         .join('\n');
-      return `${where(a.file, a.cell)} を実行 → ${a.success === false ? '失敗' : '成功'}${outputs ? `\n${outputs}` : ''}`;
+      return `${locationLabel(a.file, a.cell)} を実行 →${a.success === false ? '失敗' : '成功'}${outputs ? `\n${outputs}` : ''}`;
     }
     case 'view':
       return `${a.file} の${a.cells ? `セル${a.cells[0]}〜${a.cells[1]}` : `${a.lines?.[0]}〜${a.lines?.[1]}行`}${a.symbols.length ? `（${a.symbols.join(', ')}）` : ''}を見ていた（${Math.round((a.t1 - a.t0) / 1000)}秒）`;
@@ -100,13 +94,13 @@ export function describeAction(a: Action, origin: number, maxLines = 8): string 
     case 'debug':
       return `デバッグ: ${a.event} ${a.detail}${a.file ? `（${a.file}:${a.line}）` : ''}`;
     case 'diagnostics':
-      return `${where(a.file, a.cell)} にエラー表示 ${a.errors} 件: ${a.messages.join(' / ')}`;
+      return `${locationLabel(a.file, a.cell)} にエラー表示${a.errors} 件: ${a.messages.join(' / ')}`;
   }
 }
 
 // 操作のまとまりを、LLM に渡す説明にする（同じ種類の連続した操作なので、時刻と中身を並べる）
 export function describeGroup(g: ActionGroup, origin: number): string {
-  const body = g.actions.map((a) => `  [${clock(a.t0, origin)}] ${describeAction(a, origin).replace(/\n/g, '\n  ')}`).join('\n');
+  const body = g.actions.map((a) => `  [${clock(a.t0, origin)}] ${describeAction(a).replace(/\n/g, '\n  ')}`).join('\n');
   return `${g.id}（${clock(g.t0, origin)}〜${clock(g.t1, origin)}）\n${body}`;
 }
 

@@ -9,6 +9,7 @@ import { createWriteStream, mkdirSync, writeFileSync, type WriteStream } from 'n
 import { join } from 'node:path';
 import { structuredPatch } from 'diff';
 import * as vscode from 'vscode';
+import { stripAnsi } from '../format';
 import type { Action, DebugAction, OutputSummary } from './actions';
 import { isTarget, isTargetUri, where } from './targets';
 
@@ -25,8 +26,6 @@ const TEXT_MAX = 1500;
 const NOISE_COMMAND = /Activate\.ps1|[\\/]activate(\.bat)?\b|debugpy[\\/]launcher/i;
 
 const excerpt = (s: string, n = TEXT_MAX) => (s.length > n ? `${s.slice(0, n)}…（以下 ${s.length - n} 字略）` : s);
-// eslint-disable-next-line no-control-regex
-const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, '');
 const lastLines = (s: string, n: number) => s.split(/\r?\n/).slice(-n).join('\n');
 
 const SYMBOL_KINDS = new Set([vscode.SymbolKind.Function, vscode.SymbolKind.Method, vscode.SymbolKind.Class, vscode.SymbolKind.Constructor]);
@@ -77,7 +76,11 @@ export class ActionRecorder implements vscode.Disposable {
   private stopped: { reason: string; text?: string; t: number } | undefined;
   private readonly pending = new Set<Promise<void>>();
 
-  constructor(private readonly dir: string) {
+  // isFocused: 手での編集は、フォーカスのあるウィンドウでしか起きない（テストでは差し替える。別のウィンドウで作業していても落ちないように）
+  constructor(
+    private readonly dir: string,
+    private readonly isFocused: () => boolean = () => vscode.window.state.focused,
+  ) {
     mkdirSync(join(dir, 'images'), { recursive: true });
     this.out = createWriteStream(join(dir, 'actions.jsonl'), { flags: 'a' });
     for (const doc of vscode.workspace.textDocuments) if (isTarget(doc)) this.snapshots.set(doc.uri.toString(), doc.getText());
@@ -117,7 +120,7 @@ export class ActionRecorder implements vscode.Disposable {
 
   private isManual(e: vscode.TextDocumentChangeEvent, fsPath: string): boolean {
     const doc = e.document;
-    if (!vscode.window.state.focused) return false;
+    if (!this.isFocused()) return false;
     const active =
       vscode.window.activeTextEditor?.document === doc ||
       (doc.uri.scheme === 'vscode-notebook-cell' && !!vscode.window.activeNotebookEditor?.notebook.getCells().some((c) => c.document === doc));
@@ -227,7 +230,7 @@ export class ActionRecorder implements vscode.Disposable {
 
   private startView(): void {
     this.endView();
-    if (!vscode.window.state.focused) return;
+    if (!this.isFocused()) return;
     const nb = vscode.window.activeNotebookEditor;
     const editor = vscode.window.activeTextEditor;
     if (editor && editor.document.uri.scheme === 'file' && isTarget(editor.document)) {
